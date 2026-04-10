@@ -45,3 +45,8 @@ backend/
 │
 ├── .env.example                 # Example environment variables
 └── requirements.txt             # Python dependencies
+```
+## Start the APP
+uvicorn app.main:app --reload
+
+## Endpoints
