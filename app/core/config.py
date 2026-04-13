@@ -12,6 +12,8 @@ class Settings(BaseSettings):
 
     # Temporary switch so we can wire routes before Cognito verification
     auth_bypass: bool = True
+    database_url: str = "postgresql+psycopg://postgres:@localhost:5432/oasis"
+
 
     model_config = SettingsConfigDict(
         env_file=".env",
