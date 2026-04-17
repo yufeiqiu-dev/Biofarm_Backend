@@ -42,11 +42,16 @@ def add_product(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
-    product = create_product(db, payload)
-
+    try:
+        product = create_product(db, payload)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
     if not product:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create product",
         )
     return product

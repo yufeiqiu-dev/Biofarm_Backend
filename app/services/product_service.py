@@ -2,6 +2,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.exc import IntegrityError
 
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
@@ -45,7 +46,11 @@ def create_product(db: Session, payload: ProductCreate) -> Product:
         db_product.variants.append(db_variant)
 
     db.add(db_product)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ValueError("Product cat_id or variant catalog_id already exists")
     db.refresh(db_product)
 
     return get_product_by_id(db, db_product.id)
