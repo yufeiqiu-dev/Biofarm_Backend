@@ -42,7 +42,14 @@ def add_product(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
-    return create_product(db, payload)
+    product = create_product(db, payload)
+
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to create product",
+        )
+    return product
 
 
 @router.put("/{product_id}", response_model=ProductOut)
