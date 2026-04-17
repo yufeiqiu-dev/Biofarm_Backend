@@ -1,6 +1,18 @@
-from fastapi import APIRouter, Depends
+from uuid import UUID
 
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
 from app.dependencies.auth import require_admin
+from app.schemas.product import ProductCreate, ProductOut, ProductUpdate
+from app.services.product_service import (
+    create_product,
+    delete_product,
+    get_product_by_id,
+    list_products,
+    update_product,
+)
 
 router = APIRouter(
     prefix="/admin/products",
@@ -8,9 +20,62 @@ router = APIRouter(
 )
 
 
-@router.get("/ping")
-def admin_products_ping(current_user=Depends(require_admin)):
-    return {
-        "message": "Admin products router ready",
-        "current_user": current_user,
-    }
+@router.get("", response_model=list[ProductOut])
+def get_products(
+    db: Session = Depends(get_db),
+):
+    return list_products(db)
+
+
+@router.get("/{product_id}", response_model=ProductOut)
+def get_product(
+    product_id: UUID,
+    db: Session = Depends(get_db)
+):
+    product = get_product_by_id(db, product_id)
+    if product is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found",
+        )
+    return product
+
+
+@router.post("", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
+def add_product(
+    payload: ProductCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    return create_product(db, payload)
+
+
+@router.put("/{product_id}", response_model=ProductOut)
+def edit_product(
+    product_id: UUID,
+    payload: ProductUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    product = update_product(db, product_id, payload)
+    if product is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found",
+        )
+    return product
+
+
+@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_product(
+    product_id: UUID,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    deleted = delete_product(db, product_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -39,7 +39,7 @@ class ProductBase(BaseModel):
 
 
 class ProductCreate(ProductBase):
-    variants: list[ProductVariantCreate] = []
+    variants: list[ProductVariantCreate] = Field(default_factory=list)
 
 
 class ProductUpdate(BaseModel):
@@ -53,4 +53,4 @@ class ProductOut(ProductBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    variants: list[ProductVariantOut] = []
+    variants: list[ProductVariantOut] = Field(default_factory=list)
