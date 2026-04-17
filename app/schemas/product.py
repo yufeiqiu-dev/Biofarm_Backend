@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import uuid
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,18 +16,13 @@ class ProductVariantCreate(ProductVariantBase):
     pass
 
 
-class ProductVariantUpdate(BaseModel):
-    catalog_id: Optional[str] = Field(default=None, min_length=1, max_length=100)
-    size_value: Optional[float] = Field(default=None, gt=0)
-    size_unit: Optional[str] = Field(default=None, min_length=1, max_length=50)
-    price: Optional[float] = Field(default=None, ge=0)
-    stock: Optional[int] = Field(default=None, ge=0)
-
-
 class ProductVariantOut(ProductVariantBase):
     model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
 
-    id: str
+
+class ProductVariantNestedUpdate(ProductVariantBase):
+    id: Optional[uuid.UUID] = None
 
 
 class ProductBase(BaseModel):
@@ -47,10 +41,10 @@ class ProductUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, min_length=1)
     image_url: Optional[str] = None
+    variants: Optional[list[ProductVariantNestedUpdate]] = None
 
 
 class ProductOut(ProductBase):
     model_config = ConfigDict(from_attributes=True)
-
-    id: str
+    id: uuid.UUID
     variants: list[ProductVariantOut] = Field(default_factory=list)

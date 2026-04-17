@@ -21,17 +21,12 @@ router = APIRouter(
 
 
 @router.get("", response_model=list[ProductOut])
-def get_products(
-    db: Session = Depends(get_db),
-):
+def get_products(db: Session = Depends(get_db)):
     return list_products(db)
 
 
 @router.get("/{product_id}", response_model=ProductOut)
-def get_product(
-    product_id: UUID,
-    db: Session = Depends(get_db)
-):
+def get_product(product_id: UUID, db: Session = Depends(get_db)):
     product = get_product_by_id(db, product_id)
     if product is None:
         raise HTTPException(
@@ -57,12 +52,20 @@ def edit_product(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
-    product = update_product(db, product_id, payload)
+    try:
+        product = update_product(db, product_id, payload)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
     if product is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found",
         )
+
     return product
 
 

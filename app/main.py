@@ -8,6 +8,8 @@ from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import engine
 
+import app.models
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
