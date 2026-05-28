@@ -87,3 +87,57 @@ def require_admin(request: Request):
         )
 
     return _verify_admin_token(auth_header.split(" ", 1)[1])
+
+
+def _verify_user_token(token: str) -> dict:
+    settings = get_settings()
+
+    try:
+        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {exc}")
+
+    expected_iss = (
+        f"https://cognito-idp.{settings.cognito_region}.amazonaws.com"
+        f"/{settings.cognito_user_pool_id}"
+    )
+    if payload.get("iss") != expected_iss:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token issuer")
+
+    if payload.get("token_use") != "access":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Expected an access token")
+
+    return payload
+
+
+def require_user(request: Request):
+    """Verify any valid Cognito access token (not restricted to Admin group)."""
+    settings = get_settings()
+
+    auth_header = request.headers.get("Authorization", "")
+    has_token = auth_header.startswith("Bearer ")
+
+    if settings.auth_bypass:
+        if has_token:
+            return _verify_user_token(auth_header.split(" ", 1)[1])
+        return {
+            "sub": "local-dev-user",
+            "email": "dev@example.com",
+            "cognito:groups": [],
+        }
+
+    if not has_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header",
+        )
+
+    return _verify_user_token(auth_header.split(" ", 1)[1])
