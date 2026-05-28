@@ -58,7 +58,7 @@ class OrderItem(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     order_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True
     )
     variant_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("product_variants.id", ondelete="SET NULL"), nullable=True
