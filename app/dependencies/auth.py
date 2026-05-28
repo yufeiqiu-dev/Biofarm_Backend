@@ -77,7 +77,7 @@ def require_admin(request: Request):
         return {
             "sub": "local-dev-user",
             "email": "dev@example.com",
-            "groups": ["Admin"],
+            "cognito:groups": ["Admin"],
         }
 
     if not has_token:

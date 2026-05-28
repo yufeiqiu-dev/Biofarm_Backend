@@ -118,7 +118,11 @@ def update_product(db: Session, product_id: UUID, payload: ProductUpdate) -> Pro
                 if db_variant.id in existing_variants_by_id:
                     db.delete(db_variant)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise
     return get_product_by_id(db, product_id)
 
 

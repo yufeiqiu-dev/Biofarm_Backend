@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 import app.models  # noqa: F401 — registers models with Base metadata before create_all
 from app.db.base import Base
 from app.db.session import get_db
+from app.dependencies.auth import require_admin
 from app.main import app
 
 TEST_DATABASE_URL = "sqlite:///:memory:"
@@ -39,7 +40,24 @@ def client(db_session):
 
     app.dependency_overrides[get_db] = override_get_db
 
-    # Patch create_all in lifespan so it doesn't attempt a PostgreSQL connection
+    with patch.object(Base.metadata, "create_all"):
+        with TestClient(app) as c:
+            yield c
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def admin_client(db_session):
+    def override_get_db():
+        yield db_session
+
+    def override_require_admin():
+        return {"sub": "test-admin", "email": "admin@test.com", "cognito:groups": ["Admin"]}
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[require_admin] = override_require_admin
+
     with patch.object(Base.metadata, "create_all"):
         with TestClient(app) as c:
             yield c

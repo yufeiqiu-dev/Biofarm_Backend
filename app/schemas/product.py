@@ -33,7 +33,7 @@ class ProductBase(BaseModel):
 
 
 class ProductCreate(ProductBase):
-    variants: list[ProductVariantCreate] = Field(default_factory=list)
+    variants: list[ProductVariantCreate] = Field(default_factory=list, min_length=1)
 
 
 class ProductUpdate(BaseModel):
