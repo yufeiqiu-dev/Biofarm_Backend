@@ -18,6 +18,16 @@ def list_products(db: Session) -> list[Product]:
     return list(db.scalars(stmt).all())
 
 
+def list_public_products(db: Session) -> list[Product]:
+    stmt = (
+        select(Product)
+        .options(selectinload(Product.variants))
+        .where(Product.variants.any())
+        .order_by(Product.name)
+    )
+    return list(db.scalars(stmt).all())
+
+
 def get_product_by_id(db: Session, product_id: UUID) -> Product | None:
     stmt = (
         select(Product)
