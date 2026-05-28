@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.schemas.product import ProductCreate, ProductUpdate
+from app.services.s3_service import delete_s3_objects_by_urls
 
 
 def list_products(db: Session) -> list[Product]:
@@ -42,7 +43,6 @@ def create_product(db: Session, payload: ProductCreate) -> Product:
         cat_id=payload.cat_id,
         name=payload.name,
         description=payload.description,
-        image_url=payload.image_url,
     )
 
     for variant in payload.variants:
@@ -131,6 +131,15 @@ def delete_product(db: Session, product_id: UUID) -> bool:
     if db_product is None:
         return False
 
+    image_urls = list(db_product.image_urls or [])
+
     db.delete(db_product)
     db.commit()
+
+    if image_urls:
+        try:
+            delete_s3_objects_by_urls(image_urls)
+        except RuntimeError:
+            pass  # S3 cleanup is best-effort; product is already deleted from DB
+
     return True

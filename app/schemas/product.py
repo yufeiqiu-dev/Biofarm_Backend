@@ -29,22 +29,21 @@ class ProductBase(BaseModel):
     cat_id: str = Field(..., min_length=1, max_length=50)
     name: str = Field(..., min_length=1, max_length=255)
     description: str = Field(..., min_length=1)
-    image_url: Optional[str] = None
 
 
 class ProductCreate(ProductBase):
-    variants: list[ProductVariantCreate] = Field(default_factory=list, min_length=1)
+    variants: list[ProductVariantCreate] = Field(default_factory=list)
 
 
 class ProductUpdate(BaseModel):
     cat_id: Optional[str] = Field(default=None, min_length=1, max_length=50)
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, min_length=1)
-    image_url: Optional[str] = None
     variants: Optional[list[ProductVariantNestedUpdate]] = None
 
 
 class ProductOut(ProductBase):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
+    image_urls: list[str] = Field(default_factory=list)
     variants: list[ProductVariantOut] = Field(default_factory=list)

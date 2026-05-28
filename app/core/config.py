@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     database_url: str
     cognito_region: str
     cognito_user_pool_id: str
+    s3_bucket_name: str
+    aws_region: str
+    cloudfront_url: str  # e.g. https://d1234abcd.cloudfront.net
+    aws_access_key_id: str
+    aws_secret_access_key: str
 
     model_config = SettingsConfigDict(
         env_file=".env",

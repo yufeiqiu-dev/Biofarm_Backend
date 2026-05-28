@@ -1,4 +1,8 @@
 alembic==1.18.4
+boto3==1.43.16
+botocore==1.43.16
+jmespath==1.1.0
+s3transfer==0.17.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0

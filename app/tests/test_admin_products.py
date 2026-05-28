@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -25,7 +26,6 @@ def create_payload(**overrides) -> dict:
         "cat_id": "NEW-01",
         "name": "New Product",
         "description": "A new product",
-        "image_url": None,
         "variants": [
             {"catalog_id": "NEW-01-A", "size_value": 10, "size_unit": "mL", "price": 20.0, "stock": 5}
         ],
@@ -66,9 +66,10 @@ def test_create_product_duplicate_catalog_id(admin_client: TestClient, db_sessio
     assert response.status_code == 409
 
 
-def test_create_product_requires_at_least_one_variant(admin_client: TestClient):
+def test_create_product_with_no_variants_is_allowed(admin_client: TestClient):
     response = admin_client.post("/api/v1/admin/products", json=create_payload(variants=[]))
-    assert response.status_code == 422
+    assert response.status_code == 201
+    assert response.json()["variants"] == []
 
 
 def test_create_product_missing_required_fields(admin_client: TestClient):
@@ -173,8 +174,52 @@ def test_delete_product_success(admin_client: TestClient, db_session):
     db_session.commit()
     db_session.refresh(product)
 
-    response = admin_client.delete(f"/api/v1/admin/products/{product.id}")
+    with patch("app.services.product_service.delete_s3_objects_by_urls") as mock_s3:
+        response = admin_client.delete(f"/api/v1/admin/products/{product.id}")
+
     assert response.status_code == 204
+    mock_s3.assert_not_called()  # no images → no S3 call
+
+
+def test_delete_product_cleans_up_s3_images(admin_client: TestClient, db_session):
+    product = make_product("DEL-IMGS")
+    product.image_urls = [
+        "https://cdn.example.com/products/x/1.jpg",
+        "https://cdn.example.com/products/x/2.png",
+    ]
+    product.variants.append(make_variant("DEL-IMGS-A"))
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    with patch("app.services.product_service.delete_s3_objects_by_urls") as mock_s3:
+        response = admin_client.delete(f"/api/v1/admin/products/{product.id}")
+
+    assert response.status_code == 204
+    mock_s3.assert_called_once_with([
+        "https://cdn.example.com/products/x/1.jpg",
+        "https://cdn.example.com/products/x/2.png",
+    ])
+
+
+def test_delete_product_s3_failure_still_deletes_from_db(admin_client: TestClient, db_session):
+    product = make_product("DEL-S3-FAIL")
+    product.image_urls = ["https://cdn.example.com/products/x/1.jpg"]
+    product.variants.append(make_variant("DEL-S3-FAIL-A"))
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+    product_id = product.id
+
+    with patch("app.services.product_service.delete_s3_objects_by_urls", side_effect=RuntimeError("S3 down")):
+        response = admin_client.delete(f"/api/v1/admin/products/{product_id}")
+
+    assert response.status_code == 204
+
+    # Product is gone from DB even though S3 failed
+    db_session.expire_all()
+    from app.services.product_service import get_product_by_id
+    assert get_product_by_id(db_session, product_id) is None
 
 
 def test_delete_product_not_found(admin_client: TestClient):
