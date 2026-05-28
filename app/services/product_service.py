@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
@@ -19,14 +19,30 @@ def list_products(db: Session) -> list[Product]:
     return list(db.scalars(stmt).all())
 
 
-def list_public_products(db: Session) -> list[Product]:
+def list_public_products(
+    db: Session,
+    search: str | None = None,
+    tags: list[str] | None = None,
+) -> list[Product]:
     stmt = (
         select(Product)
         .options(selectinload(Product.variants))
         .where(Product.variants.any())
         .order_by(Product.name)
     )
-    return list(db.scalars(stmt).all())
+    if search:
+        term = f"%{search}%"
+        stmt = stmt.where(
+            or_(
+                Product.name.ilike(term),
+                Product.description.ilike(term),
+            )
+        )
+    results = list(db.scalars(stmt).all())
+    if tags:
+        tag_set = set(tags)
+        results = [p for p in results if tag_set.issubset(set(p.tags or []))]
+    return results
 
 
 def get_product_by_id(db: Session, product_id: UUID) -> Product | None:
@@ -43,6 +59,7 @@ def create_product(db: Session, payload: ProductCreate) -> Product:
         cat_id=payload.cat_id,
         name=payload.name,
         description=payload.description,
+        tags=payload.tags,
     )
 
     for variant in payload.variants:
@@ -75,6 +92,7 @@ def update_product(db: Session, product_id: UUID, payload: ProductUpdate) -> Pro
     product_update_data = payload.model_dump(
         exclude_unset=True,
         exclude={"variants"},
+        exclude_none=False,
     )
 
     for field, value in product_update_data.items():

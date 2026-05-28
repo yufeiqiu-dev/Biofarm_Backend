@@ -29,6 +29,7 @@ class ProductBase(BaseModel):
     cat_id: str = Field(..., min_length=1, max_length=50)
     name: str = Field(..., min_length=1, max_length=255)
     description: str = Field(..., min_length=1)
+    tags: list[str] = Field(default_factory=list)
 
 
 class ProductCreate(ProductBase):
@@ -39,6 +40,7 @@ class ProductUpdate(BaseModel):
     cat_id: Optional[str] = Field(default=None, min_length=1, max_length=50)
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, min_length=1)
+    tags: Optional[list[str]] = None
     variants: Optional[list[ProductVariantNestedUpdate]] = None
 
 

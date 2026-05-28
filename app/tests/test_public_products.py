@@ -143,3 +143,90 @@ def test_get_product_not_found(client: TestClient):
 def test_get_product_invalid_uuid(client: TestClient):
     response = client.get("/api/v1/products/not-a-valid-uuid")
     assert response.status_code == 422
+
+
+# --- Search and tag filtering ---
+
+def test_search_by_name(client: TestClient, db_session):
+    p1 = make_product("SRCH-A", name="Wash Buffer")
+    p1.variants.append(make_variant("SRCH-A-01"))
+    p2 = make_product("SRCH-B", name="Flow Cytometry Kit")
+    p2.variants.append(make_variant("SRCH-B-01"))
+    db_session.add_all([p1, p2])
+    db_session.commit()
+
+    response = client.get("/api/v1/products?search=wash")
+    assert response.status_code == 200
+    names = [p["name"] for p in response.json()]
+    assert "Wash Buffer" in names
+    assert "Flow Cytometry Kit" not in names
+
+
+def test_search_by_description(client: TestClient, db_session):
+    p = make_product("SRCH-C", name="Reagent X")
+    p.description = "Used for western blot analysis"
+    p.variants.append(make_variant("SRCH-C-01"))
+    db_session.add(p)
+    db_session.commit()
+
+    response = client.get("/api/v1/products?search=western+blot")
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+
+
+def test_search_is_case_insensitive(client: TestClient, db_session):
+    p = make_product("SRCH-D", name="ELISA Kit")
+    p.variants.append(make_variant("SRCH-D-01"))
+    db_session.add(p)
+    db_session.commit()
+
+    response = client.get("/api/v1/products?search=elisa")
+    assert response.status_code == 200
+    assert any(p["name"] == "ELISA Kit" for p in response.json())
+
+
+def test_filter_by_tag(client: TestClient, db_session):
+    p1 = make_product("TAG-A", name="Antibody A")
+    p1.tags = ["antibody", "primary"]
+    p1.variants.append(make_variant("TAG-A-01"))
+    p2 = make_product("TAG-B", name="Buffer B")
+    p2.tags = ["buffer"]
+    p2.variants.append(make_variant("TAG-B-01"))
+    db_session.add_all([p1, p2])
+    db_session.commit()
+
+    response = client.get("/api/v1/products?tags=antibody")
+    assert response.status_code == 200
+    names = [p["name"] for p in response.json()]
+    assert "Antibody A" in names
+    assert "Buffer B" not in names
+
+
+def test_filter_by_multiple_tags(client: TestClient, db_session):
+    p1 = make_product("MTAG-A", name="Primary Antibody")
+    p1.tags = ["antibody", "primary"]
+    p1.variants.append(make_variant("MTAG-A-01"))
+    p2 = make_product("MTAG-B", name="Secondary Antibody")
+    p2.tags = ["antibody", "secondary"]
+    p2.variants.append(make_variant("MTAG-B-01"))
+    db_session.add_all([p1, p2])
+    db_session.commit()
+
+    response = client.get("/api/v1/products?tags=antibody&tags=primary")
+    assert response.status_code == 200
+    names = [p["name"] for p in response.json()]
+    assert "Primary Antibody" in names
+    assert "Secondary Antibody" not in names
+
+
+def test_product_tags_returned_in_response(client: TestClient, db_session):
+    p = make_product("TAGS-OUT", name="Tagged Product")
+    p.tags = ["kit", "elisa"]
+    p.variants.append(make_variant("TAGS-OUT-01"))
+    db_session.add(p)
+    db_session.commit()
+
+    response = client.get("/api/v1/products")
+    assert response.status_code == 200
+    product = next(p for p in response.json() if p["cat_id"] == "TAGS-OUT")
+    assert set(product["tags"]) == {"kit", "elisa"}

@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -11,8 +11,12 @@ router = APIRouter(prefix="/products", tags=["products"])
 
 
 @router.get("", response_model=list[ProductOut])
-def get_products(db: Session = Depends(get_db)):
-    return list_public_products(db)
+def get_products(
+    search: str | None = Query(default=None),
+    tags: list[str] = Query(default=[]),
+    db: Session = Depends(get_db),
+):
+    return list_public_products(db, search=search, tags=tags or None)
 
 
 @router.get("/{product_id}", response_model=ProductOut)

@@ -20,6 +20,7 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     image_urls: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
+    tags: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
 
     variants: Mapped[List["ProductVariant"]] = relationship(
         back_populates="product",
