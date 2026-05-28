@@ -183,8 +183,8 @@ All tests use an in-memory SQLite database and mock all S3 calls — no AWS cred
 
 | Method | Path | Auth |
 |--------|------|------|
-| GET | `/api/v1/admin/products` | No |
-| GET | `/api/v1/admin/products/{id}` | No |
+| GET | `/api/v1/admin/products` | Admin |
+| GET | `/api/v1/admin/products/{id}` | Admin |
 | POST | `/api/v1/admin/products` | Admin |
 | PUT | `/api/v1/admin/products/{id}` | Admin |
 | DELETE | `/api/v1/admin/products/{id}` | Admin |
