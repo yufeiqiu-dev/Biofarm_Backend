@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     # For local dev, your React app is probably on Vite:
     cors_origins: list[str] = ["http://localhost:5174"]
 
-    # Set to False in production to enforce real Cognito JWT verification
-    auth_bypass: bool = True
+    # Set to True in local dev to skip Cognito verification
+    auth_bypass: bool = False
 
     cognito_region: str = "us-east-2"
     cognito_user_pool_id: str = ""
