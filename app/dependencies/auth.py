@@ -17,46 +17,17 @@ def _jwks_client() -> PyJWKClient:
     return PyJWKClient(jwks_url, cache_keys=True)
 
 
-def _decode_token(token: str, settings) -> dict:
-    signing_key = _jwks_client().get_signing_key_from_jwt(token)
-    return jwt.decode(
-        token,
-        signing_key.key,
-        algorithms=["RS256"],
-        options={"verify_aud": False},
-    )
-
-
-def require_admin(request: Request):
+def _verify_admin_token(token: str) -> dict:
     settings = get_settings()
 
-    auth_header = request.headers.get("Authorization", "")
-    has_token = auth_header.startswith("Bearer ")
-
-    if settings.auth_bypass:
-        if has_token:
-            # Real token present — decode and return the actual user
-            try:
-                return _decode_token(auth_header.split(" ", 1)[1], settings)
-            except Exception:
-                pass
-        # No token (e.g. direct curl testing) — fall back to mock
-        return {
-            "sub": "local-dev-user",
-            "email": "dev@example.com",
-            "groups": ["Admin"],
-        }
-
-    if not has_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or malformed Authorization header",
-        )
-
-    token = auth_header.split(" ", 1)[1]
-
     try:
-        payload = _decode_token(token, settings)
+        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -92,3 +63,27 @@ def require_admin(request: Request):
         )
 
     return payload
+
+
+def require_admin(request: Request):
+    settings = get_settings()
+
+    auth_header = request.headers.get("Authorization", "")
+    has_token = auth_header.startswith("Bearer ")
+
+    if settings.auth_bypass:
+        if has_token:
+            return _verify_admin_token(auth_header.split(" ", 1)[1])
+        return {
+            "sub": "local-dev-user",
+            "email": "dev@example.com",
+            "groups": ["Admin"],
+        }
+
+    if not has_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header",
+        )
+
+    return _verify_admin_token(auth_header.split(" ", 1)[1])
