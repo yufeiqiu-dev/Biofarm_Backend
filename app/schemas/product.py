@@ -3,6 +3,8 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.tag import TagOut
+
 
 class ProductVariantBase(BaseModel):
     catalog_id: str = Field(..., min_length=1, max_length=100)
@@ -29,10 +31,10 @@ class ProductBase(BaseModel):
     cat_id: str = Field(..., min_length=1, max_length=50)
     name: str = Field(..., min_length=1, max_length=255)
     description: str = Field(..., min_length=1)
-    tags: list[str] = Field(default_factory=list)
 
 
 class ProductCreate(ProductBase):
+    tag_ids: list[uuid.UUID] = Field(default_factory=list)
     variants: list[ProductVariantCreate] = Field(default_factory=list)
 
 
@@ -40,12 +42,13 @@ class ProductUpdate(BaseModel):
     cat_id: Optional[str] = Field(default=None, min_length=1, max_length=50)
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, min_length=1)
-    tags: Optional[list[str]] = None
+    tag_ids: Optional[list[uuid.UUID]] = None
     variants: Optional[list[ProductVariantNestedUpdate]] = None
 
 
 class ProductOut(ProductBase):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
+    tags: list[TagOut] = Field(default_factory=list)
     image_urls: list[str] = Field(default_factory=list)
     variants: list[ProductVariantOut] = Field(default_factory=list)

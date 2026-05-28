@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
+from app.models.tag import Tag
 
 
 def make_product(cat_id: str, name: str = "Test Product") -> Product:
@@ -186,13 +187,16 @@ def test_search_is_case_insensitive(client: TestClient, db_session):
 
 
 def test_filter_by_tag(client: TestClient, db_session):
+    t_antibody = Tag(name="antibody")
+    t_primary = Tag(name="primary")
+    t_buffer = Tag(name="buffer")
     p1 = make_product("TAG-A", name="Antibody A")
-    p1.tags = ["antibody", "primary"]
+    p1.tags = [t_antibody, t_primary]
     p1.variants.append(make_variant("TAG-A-01"))
     p2 = make_product("TAG-B", name="Buffer B")
-    p2.tags = ["buffer"]
+    p2.tags = [t_buffer]
     p2.variants.append(make_variant("TAG-B-01"))
-    db_session.add_all([p1, p2])
+    db_session.add_all([t_antibody, t_primary, t_buffer, p1, p2])
     db_session.commit()
 
     response = client.get("/api/v1/products?tags=antibody")
@@ -203,16 +207,19 @@ def test_filter_by_tag(client: TestClient, db_session):
 
 
 def test_filter_by_multiple_tags(client: TestClient, db_session):
+    t_antibody = Tag(name="antibody2")
+    t_primary = Tag(name="primary2")
+    t_secondary = Tag(name="secondary2")
     p1 = make_product("MTAG-A", name="Primary Antibody")
-    p1.tags = ["antibody", "primary"]
+    p1.tags = [t_antibody, t_primary]
     p1.variants.append(make_variant("MTAG-A-01"))
     p2 = make_product("MTAG-B", name="Secondary Antibody")
-    p2.tags = ["antibody", "secondary"]
+    p2.tags = [t_antibody, t_secondary]
     p2.variants.append(make_variant("MTAG-B-01"))
-    db_session.add_all([p1, p2])
+    db_session.add_all([t_antibody, t_primary, t_secondary, p1, p2])
     db_session.commit()
 
-    response = client.get("/api/v1/products?tags=antibody&tags=primary")
+    response = client.get("/api/v1/products?tags=antibody2&tags=primary2")
     assert response.status_code == 200
     names = [p["name"] for p in response.json()]
     assert "Primary Antibody" in names
@@ -220,13 +227,16 @@ def test_filter_by_multiple_tags(client: TestClient, db_session):
 
 
 def test_product_tags_returned_in_response(client: TestClient, db_session):
+    t_kit = Tag(name="kit")
+    t_elisa = Tag(name="elisa")
     p = make_product("TAGS-OUT", name="Tagged Product")
-    p.tags = ["kit", "elisa"]
+    p.tags = [t_kit, t_elisa]
     p.variants.append(make_variant("TAGS-OUT-01"))
-    db_session.add(p)
+    db_session.add_all([t_kit, t_elisa, p])
     db_session.commit()
 
     response = client.get("/api/v1/products")
     assert response.status_code == 200
     product = next(p for p in response.json() if p["cat_id"] == "TAGS-OUT")
-    assert set(product["tags"]) == {"kit", "elisa"}
+    tag_names = {t["name"] for t in product["tags"]}
+    assert tag_names == {"kit", "elisa"}
