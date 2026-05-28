@@ -7,17 +7,16 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     api_v1_prefix: str = "/api/v1"
 
-    # For local dev, your React app is probably on Vite:
+    # Override in production with the deployed frontend origin
     cors_origins: list[str] = ["http://localhost:5174"]
 
     # Set to True in local dev to skip Cognito verification
     auth_bypass: bool = False
 
-    cognito_region: str = "us-east-2"
-    cognito_user_pool_id: str = ""
-
-    database_url: str = "postgresql+psycopg://postgres:@localhost:5432/oasis"
-
+    # Required — must be set in .env or environment
+    database_url: str
+    cognito_region: str
+    cognito_user_pool_id: str
 
     model_config = SettingsConfigDict(
         env_file=".env",
