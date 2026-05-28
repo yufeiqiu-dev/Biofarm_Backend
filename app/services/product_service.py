@@ -94,13 +94,16 @@ def update_product(db: Session, product_id: UUID, payload: ProductUpdate) -> Pro
 
     product_update_data = payload.model_dump(
         exclude_unset=True,
-        exclude={"variants", "tag_ids"},
+        exclude={"variants", "tag_ids", "image_urls"},
     )
     for field, value in product_update_data.items():
         setattr(db_product, field, value)
 
     if payload.tag_ids is not None:
         db_product.tags = _resolve_tags(db, payload.tag_ids)
+
+    if payload.image_urls is not None:
+        db_product.image_urls = payload.image_urls
 
     if payload.variants is not None:
         existing_variants_by_id = {variant.id: variant for variant in db_product.variants}

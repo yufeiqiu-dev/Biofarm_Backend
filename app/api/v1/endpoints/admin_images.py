@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.dependencies.auth import require_admin
-from app.schemas.image import ConfirmUploadRequest, PresignedUrlRequest, PresignedUrlResponse
+from app.schemas.image import ConfirmUploadRequest, DeleteImageRequest, PresignedUrlRequest, PresignedUrlResponse
 from app.services.product_service import get_product_by_id
 from app.services.s3_service import (
     MAX_IMAGES_PER_PRODUCT,
@@ -61,6 +61,11 @@ def confirm_upload(
     product = _get_product_or_404(db, product_id)
 
     current_urls = list(product.image_urls or [])
+
+    # Idempotent: if this URL was already confirmed (e.g. a retry), return as-is.
+    if payload.image_url in current_urls:
+        return {"image_urls": current_urls}
+
     if len(current_urls) >= MAX_IMAGES_PER_PRODUCT:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -74,30 +79,26 @@ def confirm_upload(
     return {"image_urls": current_urls}
 
 
-@router.delete("/{index}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
 def delete_image(
     product_id: UUID,
-    index: int,
+    payload: DeleteImageRequest,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
     product = _get_product_or_404(db, product_id)
 
     current_urls = list(product.image_urls or [])
-    if index < 1 or index > len(current_urls):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Image at index {index} not found",
-        )
-
-    url = current_urls[index - 1]
+    # Idempotent: already deleted — treat as success so retries don't fail.
+    if payload.image_url not in current_urls:
+        return
 
     try:
-        delete_s3_objects_by_urls([url])
+        delete_s3_objects_by_urls([payload.image_url])
     except RuntimeError:
         # S3 deletion failed — still remove from DB so the list stays consistent
         pass
 
-    current_urls.pop(index - 1)
+    current_urls.remove(payload.image_url)
     product.image_urls = current_urls
     db.commit()

@@ -154,6 +154,22 @@ def test_confirm_upload_product_not_found(admin_client: TestClient):
     assert response.status_code == 404
 
 
+def test_confirm_upload_idempotent(admin_client: TestClient, db_session):
+    image_url = f"{FAKE_CF_URL}/products/x/1.jpg"
+    product = make_product("CONF-04", image_urls=[image_url])
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    response = admin_client.post(
+        f"/api/v1/admin/products/{product.id}/images/confirm",
+        json={"image_url": image_url},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["image_urls"].count(image_url) == 1  # not duplicated
+
+
 def test_confirm_upload_max_images_reached(admin_client: TestClient, db_session):
     urls = [f"{FAKE_CF_URL}/products/x/{i}.jpg" for i in range(1, 11)]  # 10 images
     product = make_product("CONF-03", image_urls=urls)
@@ -168,30 +184,33 @@ def test_confirm_upload_max_images_reached(admin_client: TestClient, db_session)
     assert response.status_code == 400
 
 
-# --- DELETE /{index} ---
+# --- DELETE / (by URL) ---
 
 def test_delete_image_success(admin_client: TestClient, db_session):
-    product = make_product("DEL-IMG-01", image_urls=[
-        f"{FAKE_CF_URL}/products/x/1.jpg",
-        f"{FAKE_CF_URL}/products/x/2.png",
-    ])
+    url1 = f"{FAKE_CF_URL}/products/x/1.jpg"
+    url2 = f"{FAKE_CF_URL}/products/x/2.png"
+    product = make_product("DEL-IMG-01", image_urls=[url1, url2])
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
     p1, p2, p3 = _patch_s3()
     with p1, p2, p3:
-        response = admin_client.delete(f"/api/v1/admin/products/{product.id}/images/1")
+        response = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{product.id}/images/",
+            json={"image_url": url1},
+        )
 
     assert response.status_code == 204
 
     # Confirm DB was updated
     db_session.refresh(product)
     assert len(product.image_urls) == 1
-    assert "2.png" in product.image_urls[0]
+    assert product.image_urls[0] == url2
 
 
-def test_delete_image_index_out_of_range(admin_client: TestClient, db_session):
+def test_delete_image_not_found_is_idempotent(admin_client: TestClient, db_session):
     product = make_product("DEL-IMG-02", image_urls=[f"{FAKE_CF_URL}/products/x/1.jpg"])
     db_session.add(product)
     db_session.commit()
@@ -199,27 +218,40 @@ def test_delete_image_index_out_of_range(admin_client: TestClient, db_session):
 
     p1, p2, p3 = _patch_s3()
     with p1, p2, p3:
-        response = admin_client.delete(f"/api/v1/admin/products/{product.id}/images/5")
+        response = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{product.id}/images/",
+            json={"image_url": "https://cdn.example.com/products/x/nonexistent.jpg"},
+        )
 
-    assert response.status_code == 404
+    assert response.status_code == 204
 
 
 def test_delete_image_product_not_found(admin_client: TestClient):
     p1, p2, p3 = _patch_s3()
     with p1, p2, p3:
-        response = admin_client.delete(f"/api/v1/admin/products/{uuid.uuid4()}/images/1")
+        response = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{uuid.uuid4()}/images/",
+            json={"image_url": "https://cdn.example.com/products/x/1.jpg"},
+        )
     assert response.status_code == 404
 
 
 def test_delete_image_s3_failure_still_removes_from_db(admin_client: TestClient, db_session):
-    product = make_product("DEL-IMG-03", image_urls=[f"{FAKE_CF_URL}/products/x/1.jpg"])
+    url = f"{FAKE_CF_URL}/products/x/1.jpg"
+    product = make_product("DEL-IMG-03", image_urls=[url])
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
     mock_delete = MagicMock(side_effect=RuntimeError("S3 unavailable"))
     with patch("app.api.v1.endpoints.admin_images.delete_s3_objects_by_urls", mock_delete):
-        response = admin_client.delete(f"/api/v1/admin/products/{product.id}/images/1")
+        response = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{product.id}/images/",
+            json={"image_url": url},
+        )
 
     assert response.status_code == 204
     db_session.refresh(product)

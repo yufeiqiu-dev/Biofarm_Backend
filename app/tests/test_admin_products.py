@@ -148,6 +148,36 @@ def test_update_product_duplicate_catalog_id_on_new_variant(admin_client: TestCl
     assert response.status_code == 409
 
 
+def test_update_product_reorders_image_urls(admin_client: TestClient, db_session):
+    product = make_product("REORDER-01")
+    product.image_urls = ["url_a", "url_b", "url_c"]
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    response = admin_client.put(
+        f"/api/v1/admin/products/{product.id}",
+        json={"image_urls": ["url_c", "url_a", "url_b"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["image_urls"] == ["url_c", "url_a", "url_b"]
+
+
+def test_update_product_omitting_image_urls_preserves_existing(admin_client: TestClient, db_session):
+    product = make_product("PRESERVE-IMGS")
+    product.image_urls = ["url_a", "url_b"]
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    response = admin_client.put(
+        f"/api/v1/admin/products/{product.id}",
+        json={"name": "Updated Name"},
+    )
+    assert response.status_code == 200
+    assert response.json()["image_urls"] == ["url_a", "url_b"]
+
+
 def test_update_product_variant_not_belonging_to_product(admin_client: TestClient, db_session):
     p1 = make_product("P1")
     p1.variants.append(make_variant("P1-VAR"))
