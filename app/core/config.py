@@ -10,8 +10,12 @@ class Settings(BaseSettings):
     # For local dev, your React app is probably on Vite:
     cors_origins: list[str] = ["http://localhost:5174"]
 
-    # Temporary switch so we can wire routes before Cognito verification
+    # Set to False in production to enforce real Cognito JWT verification
     auth_bypass: bool = True
+
+    cognito_region: str = "us-east-2"
+    cognito_user_pool_id: str = ""
+
     database_url: str = "postgresql+psycopg://postgres:@localhost:5432/oasis"
 
 

@@ -1,21 +1,81 @@
+from functools import lru_cache
+
+import jwt
+from jwt import PyJWKClient
 from fastapi import HTTPException, Request, status
 
 from app.core.config import get_settings
 
 
+@lru_cache
+def _jwks_client() -> PyJWKClient:
+    settings = get_settings()
+    jwks_url = (
+        f"https://cognito-idp.{settings.cognito_region}.amazonaws.com"
+        f"/{settings.cognito_user_pool_id}/.well-known/jwks.json"
+    )
+    return PyJWKClient(jwks_url, cache_keys=True)
+
+
 def require_admin(request: Request):
     settings = get_settings()
 
-    # Temporary local-dev shortcut so the app can boot and routes can be tested.
-    # We will replace this with Cognito JWT verification next.
     if settings.auth_bypass:
         return {
             "sub": "local-dev-user",
             "email": "dev@example.com",
-            "groups": ["admin"],
+            "groups": ["Admin"],
         }
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Cognito verification not wired yet",
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header",
+        )
+
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+        )
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {exc}",
+        )
+
+    expected_iss = (
+        f"https://cognito-idp.{settings.cognito_region}.amazonaws.com"
+        f"/{settings.cognito_user_pool_id}"
     )
+    if payload.get("iss") != expected_iss:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token issuer",
+        )
+
+    if payload.get("token_use") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Expected an access token",
+        )
+
+    groups = payload.get("cognito:groups", [])
+    if "Admin" not in groups:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin group membership required",
+        )
+
+    return payload
