@@ -13,3 +13,7 @@ class PresignedUrlResponse(BaseModel):
 
 class ConfirmUploadRequest(BaseModel):
     image_url: str = Field(..., min_length=1)
+
+
+class DeleteImageRequest(BaseModel):
+    image_url: str = Field(..., min_length=1)

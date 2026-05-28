@@ -43,6 +43,7 @@ class ProductUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, min_length=1)
     tag_ids: Optional[list[uuid.UUID]] = None
+    image_urls: Optional[list[str]] = None
     variants: Optional[list[ProductVariantNestedUpdate]] = None
 
 

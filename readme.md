@@ -6,20 +6,24 @@ backend/
 │   ├── main.py                  # FastAPI application entry point
 │   ├── api/v1/endpoints/
 │   │   ├── admin_products.py    # Product CRUD routes (admin)
-│   │   ├── admin_images.py      # Product image upload/delete routes (admin)
+│   │   ├── admin_images.py      # Product image presign/confirm/delete routes (admin)
+│   │   ├── admin_tags.py        # Tag CRUD routes (admin)
+│   │   ├── tags.py              # Public tag listing
 │   │   └── health.py
 │   ├── core/config.py           # App configuration (pydantic-settings)
 │   ├── dependencies/auth.py     # require_admin FastAPI dependency
 │   ├── schemas/
 │   │   ├── product.py           # Product/variant request & response schemas
-│   │   └── image.py             # Presigned URL request & response schemas
+│   │   ├── image.py             # Presigned URL, confirm, and delete schemas
+│   │   └── tag.py               # Tag request & response schemas
 │   ├── services/
 │   │   ├── product_service.py   # Product business logic + S3 cleanup on delete
 │   │   └── s3_service.py        # S3/CloudFront helpers (presigned URLs, delete)
 │   ├── db/session.py            # Database session setup
 │   └── models/
 │       ├── product.py           # Product ORM model
-│       └── product_variant.py   # ProductVariant ORM model
+│       ├── product_variant.py   # ProductVariant ORM model
+│       └── tag.py               # Tag ORM model + product_tags join table
 ├── .env.example                 # Required environment variables
 └── requirements.txt
 ```
@@ -181,13 +185,53 @@ All tests use an in-memory SQLite database and mock all S3 calls — no AWS cred
 
 ## API Endpoints
 
+### Products (public)
+
 | Method | Path | Auth |
 |--------|------|------|
-| GET | `/api/v1/admin/products` | Admin |
-| GET | `/api/v1/admin/products/{id}` | Admin |
-| POST | `/api/v1/admin/products` | Admin |
-| PUT | `/api/v1/admin/products/{id}` | Admin |
-| DELETE | `/api/v1/admin/products/{id}` | Admin |
-| POST | `/api/v1/admin/products/{id}/images/presigned-url` | Admin |
-| POST | `/api/v1/admin/products/{id}/images/confirm` | Admin |
-| DELETE | `/api/v1/admin/products/{id}/images/{index}` | Admin |
+| GET | `/api/v1/products` | No — supports `?search=` and `?tag=` |
+| GET | `/api/v1/products/{id}` | No |
+
+### Products (admin)
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| GET | `/api/v1/admin/products` | Admin | |
+| GET | `/api/v1/admin/products/{id}` | Admin | |
+| POST | `/api/v1/admin/products` | Admin | |
+| PUT | `/api/v1/admin/products/{id}` | Admin | Accepts optional `image_urls` to reorder |
+| DELETE | `/api/v1/admin/products/{id}` | Admin | Cleans up S3 objects |
+
+### Images (admin)
+
+| Method | Path | Auth | Body | Notes |
+|--------|------|------|------|-------|
+| POST | `/api/v1/admin/products/{id}/images/presigned-url` | Admin | `{ extension }` | Returns signed S3 PUT URL + CloudFront URL |
+| POST | `/api/v1/admin/products/{id}/images/confirm` | Admin | `{ image_url }` | Appends URL to product; idempotent |
+| DELETE | `/api/v1/admin/products/{id}/images/` | Admin | `{ image_url }` | Removes from S3 + DB; idempotent (204 if not found) |
+
+### Tags
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| GET | `/api/v1/tags` | No | Public tag listing |
+| GET | `/api/v1/admin/tags` | Admin | |
+| POST | `/api/v1/admin/tags` | Admin | 409 on duplicate name |
+| DELETE | `/api/v1/admin/tags/{id}` | Admin | |
+
+---
+
+## Image Upload Flow
+
+Images are uploaded directly from the browser to S3 using presigned URLs — the backend never handles image bytes.
+
+1. **Presign** — `POST /images/presigned-url` → backend generates a signed PUT URL (5 min TTL) and the final CloudFront URL
+2. **Upload** — browser PUTs the file directly to S3 using the presigned URL
+3. **Confirm** — `POST /images/confirm` → backend appends the CloudFront URL to `product.image_urls`
+
+Deletions and uploads in the admin UI are deferred until "Save Changes":
+- Staged deletions are flushed first (individual URL-based DELETE calls)
+- The product is then updated (metadata + reordered `image_urls`)
+- Pending uploads are processed last (presign → PUT → confirm per file)
+
+The first URL in `product.image_urls` is the primary/display image. Sending `image_urls` in a PUT reorders without changing S3 keys.
