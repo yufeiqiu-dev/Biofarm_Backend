@@ -122,11 +122,23 @@ def cancel_order_from_failed_payment(db: Session, stripe_pi_id: str) -> Order | 
     return order
 
 
-def ship_order(db: Session, order_id: uuid.UUID) -> Order:
+def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
     order = _load_order(db, order_id)
     if order is None:
         raise ValueError(f"Order {order_id} not found")
     if order.status != OrderStatus.awaiting_fulfillment:
+        raise ValueError(f"Cannot confirm order in status {order.status.value}")
+    order.status = OrderStatus.confirmed
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def ship_order(db: Session, order_id: uuid.UUID) -> Order:
+    order = _load_order(db, order_id)
+    if order is None:
+        raise ValueError(f"Order {order_id} not found")
+    if order.status != OrderStatus.confirmed:
         raise ValueError(f"Cannot ship order in status {order.status.value}")
 
     for item in order.items:
@@ -158,6 +170,18 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
     if order is None:
         raise ValueError(f"Order {order_id} not found")
     if order.status in (OrderStatus.delivered, OrderStatus.cancelled):
+        raise ValueError(f"Cannot cancel order in status {order.status.value}")
+    order.status = OrderStatus.cancelled
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def cancel_order_by_customer(db: Session, order_id: uuid.UUID, user_id: str) -> Order:
+    order = _load_order(db, order_id)
+    if order is None or order.user_id != user_id:
+        raise ValueError("Order not found")
+    if order.status != OrderStatus.awaiting_fulfillment:
         raise ValueError(f"Cannot cancel order in status {order.status.value}")
     order.status = OrderStatus.cancelled
     db.commit()

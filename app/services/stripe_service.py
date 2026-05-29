@@ -26,9 +26,26 @@ def create_payment_intent(amount_cents: int, order_id: str) -> MockPaymentIntent
     return s.PaymentIntent.create(
         amount=amount_cents,
         currency="usd",
+        capture_method="manual",
         metadata={"order_id": order_id},
         automatic_payment_methods={"enabled": True},
     )
+
+
+def capture_payment_intent(payment_intent_id: str) -> dict | stripe.PaymentIntent:
+    settings = get_settings()
+    if settings.stripe_bypass:
+        return {"id": payment_intent_id, "status": "succeeded"}
+    s = _get_stripe()
+    return s.PaymentIntent.capture(payment_intent_id)
+
+
+def cancel_payment_intent(payment_intent_id: str) -> dict | stripe.PaymentIntent:
+    settings = get_settings()
+    if settings.stripe_bypass:
+        return {"id": payment_intent_id, "status": "canceled"}
+    s = _get_stripe()
+    return s.PaymentIntent.cancel(payment_intent_id)
 
 
 def create_refund(payment_intent_id: str) -> dict | stripe.Refund:

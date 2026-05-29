@@ -32,7 +32,7 @@ class CreatePaymentIntentRequest(BaseModel):
 
 
 class UpdateOrderStatusRequest(BaseModel):
-    status: Literal["shipped", "delivered"]
+    status: Literal["confirmed", "shipped", "delivered"]
 
 
 # --- Response schemas ---

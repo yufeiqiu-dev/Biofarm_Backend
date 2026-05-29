@@ -77,10 +77,10 @@ def test_confirm_order_unknown_pi_returns_none(db_session):
 
 
 def test_ship_order_deducts_stock(db_session):
-    from app.services.order_service import ship_order
+    from app.services.order_service import confirm_order_admin, ship_order
 
     order, variant = make_order(db_session, stock=5)
-    variant_id = variant.id
+    confirm_order_admin(db_session, order.id)
 
     result = ship_order(db_session, order.id)
 

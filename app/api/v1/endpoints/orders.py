@@ -8,13 +8,14 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.dependencies.auth import require_user
 from app.models.product_variant import ProductVariant
+from app.models.order import OrderStatus
 from app.schemas.order import CreatePaymentIntentRequest, OrderOut, PaymentIntentResponse
 from app.services.order_service import (
     create_order,
     get_order_by_id,
     get_orders_for_user,
 )
-from app.services.stripe_service import create_payment_intent
+from app.services.stripe_service import cancel_payment_intent, create_payment_intent
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -91,4 +92,30 @@ def get_my_order(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     if order.user_id != current_user["sub"]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    return order
+
+
+@router.post("/{order_id}/cancel", response_model=OrderOut)
+def cancel_my_order(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_user),
+):
+    order = get_order_by_id(db, order_id)
+    if order is None or order.user_id != current_user["sub"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    if order.status != OrderStatus.awaiting_fulfillment:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel order in status '{order.status.value}'"
+        )
+
+    try:
+        cancel_payment_intent(order.stripe_payment_intent_id)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe operation failed: {e}")
+
+    order.status = OrderStatus.cancelled
+    db.commit()
+    db.refresh(order)
     return order

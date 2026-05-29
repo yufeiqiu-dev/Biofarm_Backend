@@ -11,12 +11,13 @@ from app.models.product_variant import ProductVariant
 from app.schemas.order import AdminOrderItemOut, AdminOrderOut, UpdateOrderStatusRequest
 from app.services.order_service import (
     cancel_order,
+    confirm_order_admin,
     deliver_order,
     get_order_by_id,
     list_all_orders,
     ship_order,
 )
-from app.services.stripe_service import create_refund
+from app.services.stripe_service import cancel_payment_intent, capture_payment_intent, create_refund
 
 router = APIRouter(prefix="/admin/orders", tags=["admin-orders"])
 
@@ -109,12 +110,20 @@ def update_order_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     try:
-        if payload.status == "shipped":
+        if payload.status == "confirmed":
+            order = confirm_order_admin(db, order_id)
+            try:
+                capture_payment_intent(order.stripe_payment_intent_id)
+            except Exception as e:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe capture failed: {e}")
+        elif payload.status == "shipped":
             order = ship_order(db, order_id)
         elif payload.status == "delivered":
             order = deliver_order(db, order_id)
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid status: {payload.status}")
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -131,16 +140,19 @@ def cancel_order_endpoint(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    if order.status not in (OrderStatus.awaiting_fulfillment, OrderStatus.shipped):
+    if order.status not in (OrderStatus.awaiting_fulfillment, OrderStatus.confirmed, OrderStatus.shipped):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel order in status '{order.status.value}'"
         )
 
     try:
-        create_refund(order.stripe_payment_intent_id)
+        if order.status == OrderStatus.awaiting_fulfillment:
+            cancel_payment_intent(order.stripe_payment_intent_id)
+        else:
+            create_refund(order.stripe_payment_intent_id)
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe refund failed: {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe operation failed: {e}")
 
     try:
         order = cancel_order(db, order_id)
