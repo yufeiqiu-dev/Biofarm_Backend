@@ -1,5 +1,6 @@
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -133,6 +134,21 @@ def delete_checkout_session(db: Session, stripe_pi_id: str) -> None:
     if session:
         db.delete(session)
         db.commit()
+
+
+def cleanup_stale_checkout_sessions(db: Session, max_age_days: int = 8) -> int:
+    """Delete sessions older than max_age_days. Called at startup to catch any
+    that never received a payment_intent.canceled webhook (e.g. backend was down)."""
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
+    stale = db.scalars(
+        select(CheckoutSession).where(CheckoutSession.created_at < cutoff)
+    ).all()
+    count = len(stale)
+    for session in stale:
+        db.delete(session)
+    if count:
+        db.commit()
+    return count
 
 
 def get_orders_for_user(db: Session, user_id: str) -> list[Order]:
