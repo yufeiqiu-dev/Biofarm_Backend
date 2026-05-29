@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.session import get_db
 from app.dependencies.auth import require_user
 from app.models.product_variant import ProductVariant
@@ -66,6 +67,9 @@ def initiate_checkout(
 
         # Update the order with the real Stripe PI ID
         order.stripe_payment_intent_id = pi.id
+        # In bypass mode no webhook fires, so advance the order immediately
+        if get_settings().stripe_bypass:
+            order.status = OrderStatus.awaiting_fulfillment
         db.commit()
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
