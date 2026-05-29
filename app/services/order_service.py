@@ -213,8 +213,8 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
     order = _load_order(db, order_id)
     if order is None:
         raise ValueError(f"Order {order_id} not found")
-    if order.status in (OrderStatus.delivered, OrderStatus.cancelled):
-        raise ValueError(f"Cannot cancel order in status {order.status.value}")
+    if order.status == OrderStatus.cancelled:
+        raise ValueError(f"Order is already cancelled")
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)

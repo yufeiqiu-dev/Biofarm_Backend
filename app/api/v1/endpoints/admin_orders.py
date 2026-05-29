@@ -112,12 +112,12 @@ def update_order_status(
     try:
         if payload.status == "confirmed":
             order = confirm_order_admin(db, order_id)
+        elif payload.status == "shipped":
+            order = ship_order(db, order_id)
             try:
                 capture_payment_intent(order.stripe_payment_intent_id)
             except Exception as e:
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe capture failed: {e}")
-        elif payload.status == "shipped":
-            order = ship_order(db, order_id)
         elif payload.status == "delivered":
             order = deliver_order(db, order_id)
         else:
@@ -140,14 +140,16 @@ def cancel_order_endpoint(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    if order.status not in (OrderStatus.pending, OrderStatus.awaiting_fulfillment, OrderStatus.confirmed, OrderStatus.shipped):
+    if order.status == OrderStatus.cancelled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot cancel order in status '{order.status.value}'"
+            detail="Order is already cancelled"
         )
 
     try:
-        if order.status in (OrderStatus.pending, OrderStatus.awaiting_fulfillment):
+        # Capture happens at ship time — anything before shipped has no charge, just void the auth.
+        # shipped/delivered means money was already captured, so issue a refund.
+        if order.status in (OrderStatus.pending, OrderStatus.awaiting_fulfillment, OrderStatus.confirmed):
             cancel_payment_intent(order.stripe_payment_intent_id)
         else:
             create_refund(order.stripe_payment_intent_id)

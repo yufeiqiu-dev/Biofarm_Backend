@@ -79,7 +79,8 @@ def test_admin_get_order_detail_includes_stock(admin_client: TestClient, db_sess
     assert item["quantity"] == 2
 
 
-def test_admin_confirm_order_captures_payment(admin_client: TestClient, db_session):
+def test_admin_confirm_order_does_not_capture(admin_client: TestClient, db_session):
+    """Confirm just marks the order — no payment capture until ship."""
     order, _ = make_order_for_admin(db_session)
 
     with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent") as mock_capture:
@@ -89,18 +90,21 @@ def test_admin_confirm_order_captures_payment(admin_client: TestClient, db_sessi
         )
     assert response.status_code == 200
     assert response.json()["status"] == "confirmed"
-    mock_capture.assert_called_once_with(order.stripe_payment_intent_id)
+    mock_capture.assert_not_called()
 
 
-def test_admin_ship_order_deducts_stock(admin_client: TestClient, db_session):
+def test_admin_ship_order_captures_and_deducts_stock(admin_client: TestClient, db_session):
+    """Shipping captures payment and deducts stock."""
     order, variant = make_order_for_admin(db_session, status=OrderStatus.confirmed, qty=1, stock=5)
 
-    response = admin_client.patch(
-        f"/api/v1/admin/orders/{order.id}/status",
-        json={"status": "shipped"},
-    )
+    with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent") as mock_capture:
+        response = admin_client.patch(
+            f"/api/v1/admin/orders/{order.id}/status",
+            json={"status": "shipped"},
+        )
     assert response.status_code == 200
     assert response.json()["status"] == "shipped"
+    mock_capture.assert_called_once_with(order.stripe_payment_intent_id)
 
     db_session.refresh(variant)
     assert variant.stock == 4
@@ -134,18 +138,18 @@ def test_admin_cancel_awaiting_cancels_auth(admin_client: TestClient, db_session
     mock_refund.assert_not_called()
 
 
-def test_admin_cancel_confirmed_issues_refund(admin_client: TestClient, db_session):
-    """Cancelling a confirmed order issues a refund — money was captured at confirm time."""
+def test_admin_cancel_confirmed_voids_auth(admin_client: TestClient, db_session):
+    """Cancelling a confirmed order voids the auth — payment not yet captured (capture happens at ship)."""
     order, _ = make_order_for_admin(db_session, status=OrderStatus.confirmed)
 
-    with patch("app.api.v1.endpoints.admin_orders.create_refund") as mock_refund, \
-         patch("app.api.v1.endpoints.admin_orders.cancel_payment_intent") as mock_cancel:
+    with patch("app.api.v1.endpoints.admin_orders.cancel_payment_intent") as mock_cancel, \
+         patch("app.api.v1.endpoints.admin_orders.create_refund") as mock_refund:
         response = admin_client.post(f"/api/v1/admin/orders/{order.id}/cancel")
 
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
-    mock_refund.assert_called_once_with(order.stripe_payment_intent_id)
-    mock_cancel.assert_not_called()
+    mock_cancel.assert_called_once_with(order.stripe_payment_intent_id)
+    mock_refund.assert_not_called()
 
 
 def test_admin_cancel_shipped_issues_refund(admin_client: TestClient, db_session):
@@ -162,14 +166,27 @@ def test_admin_cancel_shipped_issues_refund(admin_client: TestClient, db_session
     mock_cancel.assert_not_called()
 
 
+def test_admin_cancel_delivered_issues_refund(admin_client: TestClient, db_session):
+    """Cancelling a delivered order issues a refund — payment was captured at ship."""
+    order, _ = make_order_for_admin(db_session, status=OrderStatus.delivered)
+
+    with patch("app.api.v1.endpoints.admin_orders.create_refund") as mock_refund, \
+         patch("app.api.v1.endpoints.admin_orders.cancel_payment_intent") as mock_cancel:
+        response = admin_client.post(f"/api/v1/admin/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    mock_refund.assert_called_once_with(order.stripe_payment_intent_id)
+    mock_cancel.assert_not_called()
+
+
 def test_admin_ship_wrong_status_returns_400(admin_client: TestClient, db_session):
     order, _ = make_order_for_admin(db_session, status=OrderStatus.shipped)
 
-    with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent"):
-        response = admin_client.patch(
-            f"/api/v1/admin/orders/{order.id}/status",
-            json={"status": "shipped"},
-        )
+    response = admin_client.patch(
+        f"/api/v1/admin/orders/{order.id}/status",
+        json={"status": "shipped"},
+    )
     assert response.status_code == 400
 
 
