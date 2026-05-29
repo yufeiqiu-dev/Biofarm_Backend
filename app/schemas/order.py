@@ -33,6 +33,7 @@ class CreatePaymentIntentRequest(BaseModel):
 
 class UpdateOrderStatusRequest(BaseModel):
     status: Literal["confirmed", "shipped", "delivered"]
+    tracking_number: Optional[str] = None
 
 
 # --- Response schemas ---
@@ -70,6 +71,7 @@ class OrderOut(BaseModel):
     shipping_state: str
     shipping_zip: str
     notes: Optional[str]
+    tracking_number: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     items: list[OrderItemOut] = Field(default_factory=list)

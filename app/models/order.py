@@ -43,6 +43,7 @@ class Order(Base):
     card_brand: Mapped[str] = mapped_column(String(50), nullable=False, server_default="")
     card_last4: Mapped[str] = mapped_column(String(4), nullable=False, server_default="")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tracking_number: Mapped[str | None] = mapped_column(String(255), nullable=True)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default="0.00")
     created_at: Mapped[datetime] = mapped_column(

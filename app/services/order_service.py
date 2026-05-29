@@ -218,13 +218,15 @@ def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
     return order
 
 
-def ship_order(db: Session, order_id: uuid.UUID) -> Order:
+def ship_order(db: Session, order_id: uuid.UUID, tracking_number: str | None = None) -> Order:
     order = _load_order(db, order_id)
     if order is None:
         raise ValueError(f"Order {order_id} not found")
     if order.status != OrderStatus.confirmed:
         raise ValueError(f"Cannot ship order in status {order.status.value}")
     order.status = OrderStatus.shipped
+    if tracking_number:
+        order.tracking_number = tracking_number
     db.commit()
     db.refresh(order)
     return order

@@ -68,6 +68,7 @@ def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
         shipping_state=order.shipping_state,
         shipping_zip=order.shipping_zip,
         notes=order.notes,
+        tracking_number=order.tracking_number,
         created_at=order.created_at,
         updated_at=order.updated_at,
         items=items,
@@ -117,7 +118,7 @@ def update_order_status(
         if payload.status == "confirmed":
             order = confirm_order_admin(db, order_id)
         elif payload.status == "shipped":
-            order = ship_order(db, order_id)
+            order = ship_order(db, order_id, tracking_number=payload.tracking_number)
             try:
                 capture_payment_intent(order.stripe_payment_intent_id)
             except Exception as e:

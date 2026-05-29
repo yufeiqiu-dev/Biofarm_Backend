@@ -1,11 +1,14 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.dependencies.auth import require_admin
+from app.models.order import Order, OrderItem, OrderStatus
+from app.models.product_variant import ProductVariant
 from app.schemas.product import ProductCreate, ProductOut, ProductUpdate
 from app.services.product_service import (
     create_product,
@@ -93,10 +96,29 @@ def remove_product(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
-    deleted = delete_product(db, product_id)
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found",
-        )
+    product = get_product_by_id(db, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    variant_ids = [v.id for v in product.variants]
+    if variant_ids:
+        active_statuses = [
+            OrderStatus.pending, OrderStatus.awaiting_fulfillment,
+            OrderStatus.confirmed, OrderStatus.shipped,
+        ]
+        active_count = db.scalar(
+            select(func.count()).select_from(OrderItem)
+            .join(Order, OrderItem.order_id == Order.id)
+            .where(
+                OrderItem.variant_id.in_(variant_ids),
+                Order.status.in_(active_statuses),
+            )
+        ) or 0
+        if active_count > 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot delete: {active_count} active order(s) reference this product. Cancel or complete those orders first.",
+            )
+
+    delete_product(db, product_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
