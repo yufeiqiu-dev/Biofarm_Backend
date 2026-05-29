@@ -91,6 +91,28 @@ def test_webhook_payment_failed_cancels_order(client, db_session):
     assert order.status == OrderStatus.cancelled
 
 
+def test_webhook_payment_succeeded_idempotent(client, db_session):
+    """Re-delivering payment_intent.succeeded on an already-fulfilled order is a no-op."""
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    order = make_pending_order(db_session, pi_id)
+    # Advance order to shipped status
+    from app.models.order import OrderStatus
+    order.status = OrderStatus.shipped
+    db_session.commit()
+
+    with patch("app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+               return_value=make_stripe_event("payment_intent.succeeded", pi_id)):
+        response = client.post(
+            "/api/v1/stripe/webhook",
+            content=b"fake-payload",
+            headers={"stripe-signature": "t=1,v1=fake"},
+        )
+
+    assert response.status_code == 200
+    db_session.refresh(order)
+    assert order.status == OrderStatus.shipped  # unchanged
+
+
 def test_webhook_invalid_signature_returns_400(client):
     import stripe
     with patch("app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",

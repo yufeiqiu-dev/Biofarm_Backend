@@ -104,8 +104,8 @@ def get_order_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
 
 def confirm_order(db: Session, stripe_pi_id: str) -> Order | None:
     order = _load_order_by_pi(db, stripe_pi_id)
-    if order is None:
-        return None
+    if order is None or order.status != OrderStatus.pending:
+        return order  # already processed or non-existent — idempotent no-op
     order.status = OrderStatus.awaiting_fulfillment
     db.commit()
     db.refresh(order)
@@ -114,8 +114,8 @@ def confirm_order(db: Session, stripe_pi_id: str) -> Order | None:
 
 def cancel_order_from_failed_payment(db: Session, stripe_pi_id: str) -> Order | None:
     order = _load_order_by_pi(db, stripe_pi_id)
-    if order is None:
-        return None
+    if order is None or order.status != OrderStatus.pending:
+        return order  # already processed — idempotent no-op
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)
