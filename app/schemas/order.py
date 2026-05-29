@@ -80,4 +80,4 @@ class AdminOrderOut(OrderOut):
 
 class PaymentIntentResponse(BaseModel):
     client_secret: str
-    order_id: uuid.UUID
+    order_id: Optional[uuid.UUID] = None  # only set in bypass mode

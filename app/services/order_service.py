@@ -1,9 +1,11 @@
+import json
 import uuid
 from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.models.checkout_session import CheckoutSession
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
 from app.schemas.order import CartItemIn, ShippingIn
@@ -87,6 +89,52 @@ def create_order(
     return order
 
 
+def save_checkout_session(
+    db: Session,
+    stripe_pi_id: str,
+    user_id: str,
+    cart: list[CartItemIn],
+    shipping: ShippingIn,
+) -> CheckoutSession:
+    session = CheckoutSession(
+        stripe_pi_id=stripe_pi_id,
+        user_id=user_id,
+        cart_json=json.dumps([{"variant_id": str(item.variant_id), "quantity": item.quantity} for item in cart]),
+        shipping_json=shipping.model_dump_json(),
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+def create_order_from_checkout_session(db: Session, stripe_pi_id: str) -> Order | None:
+    session = db.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == stripe_pi_id)
+    )
+    if session is None:
+        return None
+
+    cart = [CartItemIn(variant_id=item["variant_id"], quantity=item["quantity"]) for item in json.loads(session.cart_json)]
+    shipping = ShippingIn.model_validate_json(session.shipping_json)
+
+    order = create_order(db, user_id=session.user_id, cart=cart, shipping=shipping, stripe_pi_id=stripe_pi_id)
+    order.status = OrderStatus.awaiting_fulfillment
+    db.delete(session)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def delete_checkout_session(db: Session, stripe_pi_id: str) -> None:
+    session = db.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == stripe_pi_id)
+    )
+    if session:
+        db.delete(session)
+        db.commit()
+
+
 def get_orders_for_user(db: Session, user_id: str) -> list[Order]:
     return list(
         db.scalars(
@@ -100,26 +148,6 @@ def get_orders_for_user(db: Session, user_id: str) -> list[Order]:
 
 def get_order_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
     return _load_order(db, order_id)
-
-
-def confirm_order(db: Session, stripe_pi_id: str) -> Order | None:
-    order = _load_order_by_pi(db, stripe_pi_id)
-    if order is None or order.status != OrderStatus.pending:
-        return order  # already processed or non-existent — idempotent no-op
-    order.status = OrderStatus.awaiting_fulfillment
-    db.commit()
-    db.refresh(order)
-    return order
-
-
-def cancel_order_from_cancelled_pi(db: Session, stripe_pi_id: str) -> Order | None:
-    order = _load_order_by_pi(db, stripe_pi_id)
-    if order is None or order.status != OrderStatus.pending:
-        return order  # already processed — idempotent no-op
-    order.status = OrderStatus.cancelled
-    db.commit()
-    db.refresh(order)
-    return order
 
 
 def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:

@@ -17,17 +17,18 @@ def _get_stripe():
     return stripe
 
 
-def create_payment_intent(amount_cents: int, order_id: str) -> MockPaymentIntent | stripe.PaymentIntent:
+def create_payment_intent(amount_cents: int, order_id: str | None = None) -> MockPaymentIntent | stripe.PaymentIntent:
     settings = get_settings()
     if settings.stripe_bypass:
         bypass_id = f"pi_bypass_{uuid.uuid4().hex[:16]}"
         return MockPaymentIntent(id=bypass_id, client_secret=f"{bypass_id}_secret_bypass")
     s = _get_stripe()
+    metadata = {"order_id": order_id} if order_id else {}
     return s.PaymentIntent.create(
         amount=amount_cents,
         currency="usd",
         capture_method="manual",
-        metadata={"order_id": order_id},
+        metadata=metadata,
         automatic_payment_methods={"enabled": True},
     )
 

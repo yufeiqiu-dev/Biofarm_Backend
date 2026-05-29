@@ -57,25 +57,6 @@ def make_order(db_session, user_id: str = "test-user-123", status: OrderStatus =
 
 # --- order_service tests ---
 
-def test_confirm_order_transitions_to_awaiting_fulfillment(db_session):
-    from app.services.order_service import confirm_order
-
-    order, _ = make_order(db_session, status=OrderStatus.pending)
-    pi_id = order.stripe_payment_intent_id
-
-    result = confirm_order(db_session, pi_id)
-
-    assert result is not None
-    assert result.status == OrderStatus.awaiting_fulfillment
-
-
-def test_confirm_order_unknown_pi_returns_none(db_session):
-    from app.services.order_service import confirm_order
-
-    result = confirm_order(db_session, "pi_nonexistent")
-    assert result is None
-
-
 def test_ship_order_deducts_stock(db_session):
     from app.services.order_service import confirm_order_admin, ship_order
 
@@ -97,18 +78,6 @@ def test_ship_order_wrong_status_raises(db_session):
 
     with pytest.raises(ValueError, match="Cannot ship"):
         ship_order(db_session, order.id)
-
-
-def test_cancel_order_from_cancelled_pi(db_session):
-    from app.services.order_service import cancel_order_from_cancelled_pi
-
-    order, _ = make_order(db_session, status=OrderStatus.pending)
-    pi_id = order.stripe_payment_intent_id
-
-    result = cancel_order_from_cancelled_pi(db_session, pi_id)
-
-    assert result is not None
-    assert result.status == OrderStatus.cancelled
 
 
 # --- Customer endpoint tests ---
@@ -139,7 +108,7 @@ def test_create_payment_intent_success(user_client: TestClient, db_session):
     assert response.status_code == 201
     data = response.json()
     assert "client_secret" in data
-    assert "order_id" in data
+    assert data.get("order_id") is None  # order created only when webhook fires
 
 
 def test_create_payment_intent_unknown_variant(user_client: TestClient):

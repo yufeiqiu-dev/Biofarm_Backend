@@ -15,6 +15,7 @@ from app.services.order_service import (
     create_order,
     get_order_by_id,
     get_orders_for_user,
+    save_checkout_session,
 )
 from app.services.stripe_service import cancel_payment_intent, create_payment_intent
 
@@ -38,7 +39,6 @@ def initiate_checkout(
             for v in db.scalars(select(ProductVariant).where(ProductVariant.id.in_(variant_ids))).all()
         }
 
-        # Validate all variants exist and have sufficient stock
         for cart_item in payload.cart:
             variant = variants.get(cart_item.variant_id)
             if variant is None:
@@ -49,32 +49,31 @@ def initiate_checkout(
                     f"requested {cart_item.quantity}, available {variant.stock}"
                 )
 
-        # Create the order first with a placeholder PI ID to avoid orphaned Stripe PIs
-        placeholder_pi_id = f"pending_{uuid.uuid4().hex}"
-        order = create_order(
-            db=db,
-            user_id=current_user["sub"],
-            cart=payload.cart,
-            shipping=payload.shipping,
-            stripe_pi_id=placeholder_pi_id,
-        )
+        amount_cents = int(sum(
+            variants[item.variant_id].price * item.quantity for item in payload.cart
+        ) * 100)
 
-        # Compute amount from the persisted order total
-        amount_cents = int(order.total_amount * 100)
+        pi = create_payment_intent(amount_cents, order_id=None)
 
-        # Now create the Stripe PI with the real order ID
-        pi = create_payment_intent(amount_cents, order_id=str(order.id))
-
-        # Update the order with the real Stripe PI ID
-        order.stripe_payment_intent_id = pi.id
-        # In bypass mode no webhook fires, so advance the order immediately
         if get_settings().stripe_bypass:
+            # No webhook in bypass mode — create the order immediately
+            order = create_order(
+                db=db,
+                user_id=current_user["sub"],
+                cart=payload.cart,
+                shipping=payload.shipping,
+                stripe_pi_id=pi.id,
+            )
             order.status = OrderStatus.awaiting_fulfillment
-        db.commit()
+            db.commit()
+            return PaymentIntentResponse(client_secret=pi.client_secret, order_id=order.id)
+
+        save_checkout_session(db, stripe_pi_id=pi.id, user_id=current_user["sub"],
+                              cart=payload.cart, shipping=payload.shipping)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    return PaymentIntentResponse(client_secret=pi.client_secret, order_id=order.id)
+    return PaymentIntentResponse(client_secret=pi.client_secret)
 
 
 @router.get("", response_model=list[OrderOut])
