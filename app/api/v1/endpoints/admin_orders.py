@@ -8,7 +8,7 @@ from app.db.session import get_db
 from app.dependencies.auth import require_admin
 from app.models.order import OrderStatus
 from app.models.product_variant import ProductVariant
-from app.schemas.order import AdminOrderItemOut, AdminOrderOut, UpdateOrderStatusRequest
+from app.schemas.order import AdminOrderItemOut, AdminOrderOut, UpdateOrderStatusRequest, UpdateTrackingRequest
 from app.services.order_service import (
     cancel_order,
     confirm_order_admin,
@@ -16,6 +16,7 @@ from app.services.order_service import (
     get_order_by_id,
     list_all_orders,
     ship_order,
+    update_tracking_number,
 )
 from app.services.stripe_service import cancel_payment_intent, capture_payment_intent, create_refund
 
@@ -132,6 +133,20 @@ def update_order_status(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
+    return _build_admin_order_out(order, db)
+
+
+@router.patch("/{order_id}/tracking", response_model=AdminOrderOut)
+def update_tracking(
+    order_id: uuid.UUID,
+    payload: UpdateTrackingRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    try:
+        order = update_tracking_number(db, order_id, payload.tracking_number)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return _build_admin_order_out(order, db)
 
 

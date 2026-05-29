@@ -232,6 +232,18 @@ def ship_order(db: Session, order_id: uuid.UUID, tracking_number: str | None = N
     return order
 
 
+def update_tracking_number(db: Session, order_id: uuid.UUID, tracking_number: str) -> Order:
+    order = _load_order(db, order_id)
+    if order is None:
+        raise ValueError(f"Order {order_id} not found")
+    if order.status not in (OrderStatus.shipped, OrderStatus.delivered):
+        raise ValueError("Tracking number can only be set on shipped or delivered orders")
+    order.tracking_number = tracking_number
+    db.commit()
+    db.refresh(order)
+    return order
+
+
 def deliver_order(db: Session, order_id: uuid.UUID) -> Order:
     order = _load_order(db, order_id)
     if order is None:

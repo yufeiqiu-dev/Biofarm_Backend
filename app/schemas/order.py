@@ -36,6 +36,10 @@ class UpdateOrderStatusRequest(BaseModel):
     tracking_number: Optional[str] = None
 
 
+class UpdateTrackingRequest(BaseModel):
+    tracking_number: str = Field(..., max_length=255)
+
+
 # --- Response schemas ---
 
 class OrderItemOut(BaseModel):
