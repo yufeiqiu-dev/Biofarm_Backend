@@ -61,8 +61,26 @@ def post_webhook(client, pi_id: str, event_type: str):
         )
 
 
-def test_webhook_payment_succeeded_creates_order(client, db_session):
-    """payment_intent.succeeded creates an Order from the CheckoutSession."""
+def test_webhook_amount_capturable_updated_creates_order(client, db_session):
+    """payment_intent.amount_capturable_updated (customer authorized) creates Order from CheckoutSession."""
+    from sqlalchemy import select
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    variant = make_product_and_variant(db_session)
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    response = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
+
+    assert response.status_code == 200
+    order = db_session.scalar(select(Order).where(Order.stripe_payment_intent_id == pi_id))
+    assert order is not None
+    assert order.status == OrderStatus.awaiting_fulfillment
+    session = db_session.scalar(select(CheckoutSession).where(CheckoutSession.stripe_pi_id == pi_id))
+    assert session is None
+
+
+def test_webhook_payment_succeeded_creates_order_fallback(client, db_session):
+    """payment_intent.succeeded is a fallback — creates order if not already created."""
+    from sqlalchemy import select
     pi_id = f"pi_{uuid.uuid4().hex}"
     variant = make_product_and_variant(db_session)
     make_checkout_session(db_session, pi_id, variant.id)
@@ -70,16 +88,9 @@ def test_webhook_payment_succeeded_creates_order(client, db_session):
     response = post_webhook(client, pi_id, "payment_intent.succeeded")
 
     assert response.status_code == 200
-    order = db_session.scalar(
-        __import__("sqlalchemy", fromlist=["select"]).select(Order).where(Order.stripe_payment_intent_id == pi_id)
-    )
+    order = db_session.scalar(select(Order).where(Order.stripe_payment_intent_id == pi_id))
     assert order is not None
     assert order.status == OrderStatus.awaiting_fulfillment
-    # Session must be cleaned up
-    session = db_session.scalar(
-        __import__("sqlalchemy", fromlist=["select"]).select(CheckoutSession).where(CheckoutSession.stripe_pi_id == pi_id)
-    )
-    assert session is None
 
 
 def test_webhook_pi_cancelled_deletes_session(client, db_session):
@@ -124,6 +135,7 @@ def test_webhook_payment_failed_is_noop(client, db_session):
 
 def test_webhook_retry_after_decline_succeeds(client, db_session):
     """Declined card followed by a good card: order must be created at awaiting_fulfillment."""
+    from sqlalchemy import select
     pi_id = f"pi_{uuid.uuid4().hex}"
     variant = make_product_and_variant(db_session)
     make_checkout_session(db_session, pi_id, variant.id)
@@ -131,11 +143,14 @@ def test_webhook_retry_after_decline_succeeds(client, db_session):
     # First attempt: card declined — session still intact
     post_webhook(client, pi_id, "payment_intent.payment_failed")
 
-    # Second attempt: good card — order created
-    response = post_webhook(client, pi_id, "payment_intent.succeeded")
+    from sqlalchemy import select
+    session = db_session.scalar(select(CheckoutSession).where(CheckoutSession.stripe_pi_id == pi_id))
+    assert session is not None  # still retryable
+
+    # Second attempt: good card authorized
+    response = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
 
     assert response.status_code == 200
-    from sqlalchemy import select
     order = db_session.scalar(select(Order).where(Order.stripe_payment_intent_id == pi_id))
     assert order is not None
     assert order.status == OrderStatus.awaiting_fulfillment

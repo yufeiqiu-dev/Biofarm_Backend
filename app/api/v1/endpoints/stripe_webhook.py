@@ -19,7 +19,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
 
-    if event.type == "payment_intent.succeeded":
+    if event.type == "payment_intent.amount_capturable_updated":
+        # Customer authorized the card — PI is at requires_capture, ready for admin to confirm.
+        # This is the correct event for capture_method=manual.
+        create_order_from_checkout_session(db, event.data.object.id)
+    elif event.type == "payment_intent.succeeded":
+        # Fallback: fires after capture for some payment methods. Idempotent — no-op if order already exists.
         create_order_from_checkout_session(db, event.data.object.id)
     elif event.type == "payment_intent.canceled":
         delete_checkout_session(db, event.data.object.id)
