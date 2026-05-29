@@ -195,22 +195,22 @@ def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
     if order.status != OrderStatus.awaiting_fulfillment:
         raise ValueError(f"Cannot confirm order in status {order.status.value}")
 
-    # Validate stock before committing
+    # Aggregate demand per variant (an order may have multiple items for the same variant)
+    demand: dict[uuid.UUID, tuple[int, str]] = {}  # variant_id → (total_qty, product_name)
     for item in order.items:
         if item.variant_id:
-            variant = db.get(ProductVariant, item.variant_id)
-            if variant and variant.stock < item.quantity:
-                raise ValueError(
-                    f"Insufficient stock for {item.product_name}: "
-                    f"need {item.quantity}, only {variant.stock} available"
-                )
+            qty, name = demand.get(item.variant_id, (0, item.product_name))
+            demand[item.variant_id] = (qty + item.quantity, name)
 
-    # Deduct stock — admin is setting aside inventory to fulfil this order
-    for item in order.items:
-        if item.variant_id:
-            variant = db.get(ProductVariant, item.variant_id)
-            if variant:
-                variant.stock -= item.quantity
+    # Validate then deduct in one pass — avoids per-item checks that miss combined overstock
+    for variant_id, (qty, name) in demand.items():
+        variant = db.get(ProductVariant, variant_id)
+        if variant:
+            if variant.stock < qty:
+                raise ValueError(
+                    f"Insufficient stock for {name}: need {qty}, only {variant.stock} available"
+                )
+            variant.stock -= qty
 
     order.status = OrderStatus.confirmed
     db.commit()

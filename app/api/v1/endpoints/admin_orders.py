@@ -119,11 +119,15 @@ def update_order_status(
         if payload.status == "confirmed":
             order = confirm_order_admin(db, order_id)
         elif payload.status == "shipped":
-            order = ship_order(db, order_id, tracking_number=payload.tracking_number)
+            if order.status != OrderStatus.confirmed:
+                raise ValueError(f"Cannot ship order in status {order.status.value}")
+            # Capture payment BEFORE committing status change — avoids a stuck
+            # "shipped" order if Stripe is unavailable (no retry path once shipped).
             try:
                 capture_payment_intent(order.stripe_payment_intent_id)
             except Exception as e:
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe capture failed: {e}")
+            order = ship_order(db, order_id, tracking_number=payload.tracking_number)
         elif payload.status == "delivered":
             order = deliver_order(db, order_id)
         else:
