@@ -9,6 +9,23 @@ from app.services.stripe_service import verify_webhook_signature
 router = APIRouter(prefix="/stripe", tags=["stripe"])
 
 
+def _extract_card_info(pi) -> tuple[str, str]:
+    """Return (card_brand, card_last4) from a PaymentIntent object, or ("", "")."""
+    pm_id = pi.get("payment_method") if isinstance(pi, dict) else getattr(pi, "payment_method", None)
+    if not pm_id or not isinstance(pm_id, str):
+        return "", ""
+    try:
+        pm = stripe.PaymentMethod.retrieve(pm_id)
+        card = pm.get("card") if isinstance(pm, dict) else getattr(pm, "card", None)
+        if card:
+            brand = (card.get("brand") if isinstance(card, dict) else getattr(card, "brand", "")) or ""
+            last4 = (card.get("last4") if isinstance(card, dict) else getattr(card, "last4", "")) or ""
+            return brand, last4
+    except Exception:
+        pass
+    return "", ""
+
+
 @router.post("/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.body()
@@ -20,12 +37,13 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
 
     if event.type == "payment_intent.amount_capturable_updated":
-        # Customer authorized the card — PI is at requires_capture, ready for admin to confirm.
-        # This is the correct event for capture_method=manual.
-        create_order_from_checkout_session(db, event.data.object.id)
+        pi = event.data.object
+        card_brand, card_last4 = _extract_card_info(pi)
+        create_order_from_checkout_session(db, pi.id, card_brand=card_brand, card_last4=card_last4)
     elif event.type == "payment_intent.succeeded":
-        # Fallback: fires after capture for some payment methods. Idempotent — no-op if order already exists.
-        create_order_from_checkout_session(db, event.data.object.id)
+        pi = event.data.object
+        card_brand, card_last4 = _extract_card_info(pi)
+        create_order_from_checkout_session(db, pi.id, card_brand=card_brand, card_last4=card_last4)
     elif event.type == "payment_intent.canceled":
         delete_checkout_session(db, event.data.object.id)
 

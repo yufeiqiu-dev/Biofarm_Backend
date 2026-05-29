@@ -39,6 +39,10 @@ def create_order(
     cart: list[CartItemIn],
     shipping: ShippingIn,
     stripe_pi_id: str,
+    tax_amount: Decimal = Decimal("0"),
+    customer_email: str = "",
+    card_brand: str = "",
+    card_last4: str = "",
 ) -> Order:
     variant_ids = [item.variant_id for item in cart]
     variants = {
@@ -71,6 +75,9 @@ def create_order(
     order = Order(
         order_number=_next_order_number(db),
         user_id=user_id,
+        customer_email=customer_email,
+        card_brand=card_brand,
+        card_last4=card_last4,
         status=OrderStatus.pending,
         stripe_payment_intent_id=stripe_pi_id,
         shipping_name=shipping.name,
@@ -82,6 +89,7 @@ def create_order(
         shipping_zip=shipping.zip,
         notes=shipping.notes,
         total_amount=total,
+        tax_amount=tax_amount,
         items=items,
     )
     db.add(order)
@@ -96,12 +104,16 @@ def save_checkout_session(
     user_id: str,
     cart: list[CartItemIn],
     shipping: ShippingIn,
+    tax_amount_cents: int = 0,
+    customer_email: str = "",
 ) -> CheckoutSession:
     session = CheckoutSession(
         stripe_pi_id=stripe_pi_id,
         user_id=user_id,
+        customer_email=customer_email,
         cart_json=json.dumps([{"variant_id": str(item.variant_id), "quantity": item.quantity} for item in cart]),
         shipping_json=shipping.model_dump_json(),
+        tax_amount_cents=tax_amount_cents,
     )
     db.add(session)
     db.commit()
@@ -109,7 +121,12 @@ def save_checkout_session(
     return session
 
 
-def create_order_from_checkout_session(db: Session, stripe_pi_id: str) -> Order | None:
+def create_order_from_checkout_session(
+    db: Session,
+    stripe_pi_id: str,
+    card_brand: str = "",
+    card_last4: str = "",
+) -> Order | None:
     session = db.scalar(
         select(CheckoutSession).where(CheckoutSession.stripe_pi_id == stripe_pi_id)
     )
@@ -118,8 +135,9 @@ def create_order_from_checkout_session(db: Session, stripe_pi_id: str) -> Order 
 
     cart = [CartItemIn(variant_id=item["variant_id"], quantity=item["quantity"]) for item in json.loads(session.cart_json)]
     shipping = ShippingIn.model_validate_json(session.shipping_json)
+    tax_amount = Decimal(session.tax_amount_cents) / 100
 
-    order = create_order(db, user_id=session.user_id, cart=cart, shipping=shipping, stripe_pi_id=stripe_pi_id)
+    order = create_order(db, user_id=session.user_id, cart=cart, shipping=shipping, stripe_pi_id=stripe_pi_id, tax_amount=tax_amount, customer_email=session.customer_email, card_brand=card_brand, card_last4=card_last4)
     order.status = OrderStatus.awaiting_fulfillment
     db.delete(session)
     db.commit()
@@ -166,12 +184,34 @@ def get_order_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
     return _load_order(db, order_id)
 
 
+def get_order_by_payment_intent(db: Session, pi_id: str) -> Order | None:
+    return _load_order_by_pi(db, pi_id)
+
+
 def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
     order = _load_order(db, order_id)
     if order is None:
         raise ValueError(f"Order {order_id} not found")
     if order.status != OrderStatus.awaiting_fulfillment:
         raise ValueError(f"Cannot confirm order in status {order.status.value}")
+
+    # Validate stock before committing
+    for item in order.items:
+        if item.variant_id:
+            variant = db.get(ProductVariant, item.variant_id)
+            if variant and variant.stock < item.quantity:
+                raise ValueError(
+                    f"Insufficient stock for {item.product_name}: "
+                    f"need {item.quantity}, only {variant.stock} available"
+                )
+
+    # Deduct stock — admin is setting aside inventory to fulfil this order
+    for item in order.items:
+        if item.variant_id:
+            variant = db.get(ProductVariant, item.variant_id)
+            if variant:
+                variant.stock -= item.quantity
+
     order.status = OrderStatus.confirmed
     db.commit()
     db.refresh(order)
@@ -184,13 +224,6 @@ def ship_order(db: Session, order_id: uuid.UUID) -> Order:
         raise ValueError(f"Order {order_id} not found")
     if order.status != OrderStatus.confirmed:
         raise ValueError(f"Cannot ship order in status {order.status.value}")
-
-    for item in order.items:
-        if item.variant_id:
-            variant = db.get(ProductVariant, item.variant_id)
-            if variant:
-                variant.stock = max(0, variant.stock - item.quantity)
-
     order.status = OrderStatus.shipped
     db.commit()
     db.refresh(order)
@@ -215,6 +248,15 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
         raise ValueError(f"Order {order_id} not found")
     if order.status == OrderStatus.cancelled:
         raise ValueError(f"Order is already cancelled")
+
+    # Stock was deducted at confirm — restore it if cancelling after that point
+    if order.status in (OrderStatus.confirmed, OrderStatus.shipped, OrderStatus.delivered):
+        for item in order.items:
+            if item.variant_id:
+                variant = db.get(ProductVariant, item.variant_id)
+                if variant:
+                    variant.stock += item.quantity
+
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)

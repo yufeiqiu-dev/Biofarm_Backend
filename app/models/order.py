@@ -39,8 +39,12 @@ class Order(Base):
     shipping_city: Mapped[str] = mapped_column(String(100), nullable=False)
     shipping_state: Mapped[str] = mapped_column(String(2), nullable=False)
     shipping_zip: Mapped[str] = mapped_column(String(20), nullable=False)
+    customer_email: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    card_brand: Mapped[str] = mapped_column(String(50), nullable=False, server_default="")
+    card_last4: Mapped[str] = mapped_column(String(4), nullable=False, server_default="")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default="0.00")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

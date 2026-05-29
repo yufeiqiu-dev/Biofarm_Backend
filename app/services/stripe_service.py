@@ -12,6 +12,12 @@ class MockPaymentIntent:
     client_secret: str
 
 
+@dataclass
+class TaxResult:
+    tax_amount_cents: int
+    total_cents: int
+
+
 def _get_stripe():
     stripe.api_key = get_settings().stripe_secret_key
     return stripe
@@ -30,6 +36,26 @@ def create_payment_intent(amount_cents: int, order_id: str | None = None) -> Moc
         capture_method="manual",
         metadata=metadata,
         automatic_payment_methods={"enabled": True},
+    )
+
+
+def calculate_tax(line_items: list[dict], address: dict) -> TaxResult:
+    """Calculate tax via Stripe Tax. line_items: [{amount (cents), reference, tax_code}].
+    In bypass mode, mocks 8.75% flat rate."""
+    settings = get_settings()
+    subtotal = sum(item["amount"] for item in line_items)
+    if settings.stripe_bypass:
+        tax = round(subtotal * 0.0875)
+        return TaxResult(tax_amount_cents=tax, total_cents=subtotal + tax)
+    s = _get_stripe()
+    calc = s.tax.Calculation.create(
+        currency="usd",
+        line_items=line_items,
+        customer_details={"address": address, "address_source": "shipping"},
+    )
+    return TaxResult(
+        tax_amount_cents=calc.tax_amount_exclusive,
+        total_cents=calc.amount_total,
     )
 
 

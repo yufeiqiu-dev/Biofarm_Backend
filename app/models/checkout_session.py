@@ -15,6 +15,8 @@ class CheckoutSession(Base):
     user_id: Mapped[str] = mapped_column(String(255), nullable=False)
     cart_json: Mapped[str] = mapped_column(Text, nullable=False)
     shipping_json: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_email: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    tax_amount_cents: Mapped[int] = mapped_column(nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

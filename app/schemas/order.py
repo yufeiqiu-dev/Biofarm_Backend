@@ -59,6 +59,9 @@ class OrderOut(BaseModel):
     order_number: int
     status: OrderStatus
     total_amount: Decimal
+    tax_amount: Decimal = Decimal("0")
+    card_brand: str = ""
+    card_last4: str = ""
     shipping_name: str
     shipping_phone: str
     shipping_address1: str
@@ -74,6 +77,7 @@ class OrderOut(BaseModel):
 
 class AdminOrderOut(OrderOut):
     user_id: str
+    customer_email: str = ""
     stripe_payment_intent_id: str
     items: list[AdminOrderItemOut] = Field(default_factory=list)
 
@@ -81,3 +85,5 @@ class AdminOrderOut(OrderOut):
 class PaymentIntentResponse(BaseModel):
     client_secret: str
     order_id: Optional[uuid.UUID] = None  # only set in bypass mode
+    subtotal_cents: int = 0
+    tax_amount_cents: int = 0
