@@ -106,6 +106,20 @@ def test_admin_ship_order_deducts_stock(admin_client: TestClient, db_session):
     assert variant.stock == 4
 
 
+def test_admin_cancel_pending_cancels_auth(admin_client: TestClient, db_session):
+    """Cancelling a pending order (abandoned checkout) cancels the PI — no refund."""
+    order, _ = make_order_for_admin(db_session, status=OrderStatus.pending)
+
+    with patch("app.api.v1.endpoints.admin_orders.cancel_payment_intent") as mock_cancel, \
+         patch("app.api.v1.endpoints.admin_orders.create_refund") as mock_refund:
+        response = admin_client.post(f"/api/v1/admin/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    mock_cancel.assert_called_once_with(order.stripe_payment_intent_id)
+    mock_refund.assert_not_called()
+
+
 def test_admin_cancel_awaiting_cancels_auth(admin_client: TestClient, db_session):
     """Cancelling an awaiting_fulfillment order cancels the auth — no refund."""
     order, _ = make_order_for_admin(db_session)

@@ -140,14 +140,14 @@ def cancel_order_endpoint(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    if order.status not in (OrderStatus.awaiting_fulfillment, OrderStatus.confirmed, OrderStatus.shipped):
+    if order.status not in (OrderStatus.pending, OrderStatus.awaiting_fulfillment, OrderStatus.confirmed, OrderStatus.shipped):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel order in status '{order.status.value}'"
         )
 
     try:
-        if order.status == OrderStatus.awaiting_fulfillment:
+        if order.status in (OrderStatus.pending, OrderStatus.awaiting_fulfillment):
             cancel_payment_intent(order.stripe_payment_intent_id)
         else:
             create_refund(order.stripe_payment_intent_id)

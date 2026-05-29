@@ -205,6 +205,39 @@ def test_create_payment_intent_insufficient_stock(user_client: TestClient, db_se
     assert "Insufficient stock" in response.json()["detail"]
 
 
+def test_customer_cancel_pending_order(user_client: TestClient, db_session):
+    """Customer can cancel a pending order (abandoned checkout) — cancels the PI, no refund."""
+    order, _ = make_order(db_session, user_id="test-user-123", status=OrderStatus.pending)
+
+    with patch("app.api.v1.endpoints.orders.cancel_payment_intent") as mock_cancel:
+        response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    mock_cancel.assert_called_once_with(order.stripe_payment_intent_id)
+
+
+def test_customer_cancel_awaiting_order(user_client: TestClient, db_session):
+    """Customer can cancel an awaiting_fulfillment order — cancels the PI, no refund."""
+    order, _ = make_order(db_session, user_id="test-user-123", status=OrderStatus.awaiting_fulfillment)
+
+    with patch("app.api.v1.endpoints.orders.cancel_payment_intent") as mock_cancel:
+        response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    mock_cancel.assert_called_once_with(order.stripe_payment_intent_id)
+
+
+def test_customer_cancel_confirmed_returns_400(user_client: TestClient, db_session):
+    """Customer cannot cancel once admin has confirmed (payment captured)."""
+    order, _ = make_order(db_session, user_id="test-user-123", status=OrderStatus.confirmed)
+
+    response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 400
+
+
 def test_list_orders_unauthenticated(client: TestClient):
     response = client.get("/api/v1/orders")
     assert response.status_code in (401, 403)

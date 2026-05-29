@@ -108,7 +108,7 @@ def cancel_my_order(
     order = get_order_by_id(db, order_id)
     if order is None or order.user_id != current_user["sub"]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    if order.status != OrderStatus.awaiting_fulfillment:
+    if order.status not in (OrderStatus.pending, OrderStatus.awaiting_fulfillment):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel order in status '{order.status.value}'"
