@@ -36,23 +36,36 @@ def initiate_checkout(
             for v in db.scalars(select(ProductVariant).where(ProductVariant.id.in_(variant_ids))).all()
         }
 
-        total = Decimal("0")
+        # Validate all variants exist and have sufficient stock
         for cart_item in payload.cart:
             variant = variants.get(cart_item.variant_id)
             if variant is None:
                 raise ValueError(f"Variant {cart_item.variant_id} not found")
-            total += variant.price * cart_item.quantity
+            if variant.stock < cart_item.quantity:
+                raise ValueError(
+                    f"Insufficient stock for variant {cart_item.variant_id}: "
+                    f"requested {cart_item.quantity}, available {variant.stock}"
+                )
 
-        amount_cents = int(total * 100)
-        pi = create_payment_intent(amount_cents, order_id="pending")
-
+        # Create the order first with a placeholder PI ID to avoid orphaned Stripe PIs
+        placeholder_pi_id = f"pending_{uuid.uuid4().hex}"
         order = create_order(
             db=db,
             user_id=current_user["sub"],
             cart=payload.cart,
             shipping=payload.shipping,
-            stripe_pi_id=pi.id,
+            stripe_pi_id=placeholder_pi_id,
         )
+
+        # Compute amount from the persisted order total
+        amount_cents = int(order.total_amount * 100)
+
+        # Now create the Stripe PI with the real order ID
+        pi = create_payment_intent(amount_cents, order_id=str(order.id))
+
+        # Update the order with the real Stripe PI ID
+        order.stripe_payment_intent_id = pi.id
+        db.commit()
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -77,5 +90,5 @@ def get_my_order(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     if order.user_id != current_user["sub"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     return order
