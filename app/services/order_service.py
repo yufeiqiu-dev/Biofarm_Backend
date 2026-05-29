@@ -112,7 +112,7 @@ def confirm_order(db: Session, stripe_pi_id: str) -> Order | None:
     return order
 
 
-def cancel_order_from_failed_payment(db: Session, stripe_pi_id: str) -> Order | None:
+def cancel_order_from_cancelled_pi(db: Session, stripe_pi_id: str) -> Order | None:
     order = _load_order_by_pi(db, stripe_pi_id)
     if order is None or order.status != OrderStatus.pending:
         return order  # already processed — idempotent no-op

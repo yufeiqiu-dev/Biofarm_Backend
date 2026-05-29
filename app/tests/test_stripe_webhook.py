@@ -74,7 +74,26 @@ def test_webhook_payment_succeeded_confirms_order(client, db_session):
     assert order.status == OrderStatus.awaiting_fulfillment
 
 
-def test_webhook_payment_failed_cancels_order(client, db_session):
+def test_webhook_pi_cancelled_cancels_order(client, db_session):
+    """payment_intent.canceled (PI permanently closed) cancels the order."""
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    order = make_pending_order(db_session, pi_id)
+
+    with patch("app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+               return_value=make_stripe_event("payment_intent.canceled", pi_id)):
+        response = client.post(
+            "/api/v1/stripe/webhook",
+            content=b"fake-payload",
+            headers={"stripe-signature": "t=1,v1=fake"},
+        )
+
+    assert response.status_code == 200
+    db_session.refresh(order)
+    assert order.status == OrderStatus.cancelled
+
+
+def test_webhook_payment_failed_is_noop(client, db_session):
+    """payment_intent.payment_failed (single decline) must not cancel — retry is still possible."""
     pi_id = f"pi_{uuid.uuid4().hex}"
     order = make_pending_order(db_session, pi_id)
 
@@ -88,7 +107,32 @@ def test_webhook_payment_failed_cancels_order(client, db_session):
 
     assert response.status_code == 200
     db_session.refresh(order)
-    assert order.status == OrderStatus.cancelled
+    assert order.status == OrderStatus.pending  # unchanged — still retryable
+
+
+def test_webhook_retry_after_decline_succeeds(client, db_session):
+    """Declined card followed by a good card: order must end up awaiting_fulfillment."""
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    order = make_pending_order(db_session, pi_id)
+
+    # First attempt: card declined
+    with patch("app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+               return_value=make_stripe_event("payment_intent.payment_failed", pi_id)):
+        client.post("/api/v1/stripe/webhook", content=b"fake-payload",
+                    headers={"stripe-signature": "t=1,v1=fake"})
+
+    db_session.refresh(order)
+    assert order.status == OrderStatus.pending  # still open for retry
+
+    # Second attempt: good card
+    with patch("app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+               return_value=make_stripe_event("payment_intent.succeeded", pi_id)):
+        response = client.post("/api/v1/stripe/webhook", content=b"fake-payload",
+                               headers={"stripe-signature": "t=1,v1=fake"})
+
+    assert response.status_code == 200
+    db_session.refresh(order)
+    assert order.status == OrderStatus.awaiting_fulfillment
 
 
 def test_webhook_payment_succeeded_idempotent(client, db_session):

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.services.order_service import cancel_order_from_failed_payment, confirm_order
+from app.services.order_service import cancel_order_from_cancelled_pi, confirm_order
 from app.services.stripe_service import verify_webhook_signature
 
 router = APIRouter(prefix="/stripe", tags=["stripe"])
@@ -21,7 +21,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
     if event.type == "payment_intent.succeeded":
         confirm_order(db, event.data.object.id)
-    elif event.type == "payment_intent.payment_failed":
-        cancel_order_from_failed_payment(db, event.data.object.id)
+    elif event.type == "payment_intent.canceled":
+        cancel_order_from_cancelled_pi(db, event.data.object.id)
 
     return {"status": "ok"}

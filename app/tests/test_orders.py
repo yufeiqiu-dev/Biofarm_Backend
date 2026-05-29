@@ -99,13 +99,13 @@ def test_ship_order_wrong_status_raises(db_session):
         ship_order(db_session, order.id)
 
 
-def test_cancel_order_from_failed_payment(db_session):
-    from app.services.order_service import cancel_order_from_failed_payment
+def test_cancel_order_from_cancelled_pi(db_session):
+    from app.services.order_service import cancel_order_from_cancelled_pi
 
     order, _ = make_order(db_session, status=OrderStatus.pending)
     pi_id = order.stripe_payment_intent_id
 
-    result = cancel_order_from_failed_payment(db_session, pi_id)
+    result = cancel_order_from_cancelled_pi(db_session, pi_id)
 
     assert result is not None
     assert result.status == OrderStatus.cancelled
