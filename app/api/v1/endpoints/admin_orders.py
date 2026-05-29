@@ -22,25 +22,28 @@ router = APIRouter(prefix="/admin/orders", tags=["admin-orders"])
 
 
 def _enrich_items_with_stock(order, db: Session):
-    enriched = []
-    for item in order.items:
-        current_stock = None
-        if item.variant_id:
-            variant = db.get(ProductVariant, item.variant_id)
-            if variant:
-                current_stock = variant.stock
-        enriched.append(
-            AdminOrderItemOut(
-                id=item.id,
-                variant_id=item.variant_id,
-                product_name=item.product_name,
-                variant_label=item.variant_label,
-                unit_price=item.unit_price,
-                quantity=item.quantity,
-                current_stock=current_stock,
-            )
+    from sqlalchemy import select
+
+    variant_ids = [item.variant_id for item in order.items if item.variant_id]
+    stock_map: dict = {}
+    if variant_ids:
+        rows = db.execute(
+            select(ProductVariant.id, ProductVariant.stock).where(ProductVariant.id.in_(variant_ids))
+        ).all()
+        stock_map = {row.id: row.stock for row in rows}
+
+    return [
+        AdminOrderItemOut(
+            id=item.id,
+            variant_id=item.variant_id,
+            product_name=item.product_name,
+            variant_label=item.variant_label,
+            unit_price=item.unit_price,
+            quantity=item.quantity,
+            current_stock=stock_map.get(item.variant_id) if item.variant_id else None,
         )
-    return enriched
+        for item in order.items
+    ]
 
 
 def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
@@ -101,13 +104,20 @@ def update_order_status(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
+    order = get_order_by_id(db, order_id)
+    if order is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
     try:
         if payload.status == "shipped":
             order = ship_order(db, order_id)
-        else:
+        elif payload.status == "delivered":
             order = deliver_order(db, order_id)
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid status: {payload.status}")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
     return _build_admin_order_out(order, db)
 
 
@@ -120,6 +130,12 @@ def cancel_order_endpoint(
     order = get_order_by_id(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    if order.status not in (OrderStatus.awaiting_fulfillment, OrderStatus.shipped):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel order in status '{order.status.value}'"
+        )
 
     try:
         create_refund(order.stripe_payment_intent_id)

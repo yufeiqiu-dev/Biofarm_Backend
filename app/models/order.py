@@ -13,7 +13,6 @@ from app.db.base import Base
 
 class OrderStatus(enum.Enum):
     pending = "pending"
-    confirmed = "confirmed"
     awaiting_fulfillment = "awaiting_fulfillment"
     shipped = "shipped"
     delivered = "delivered"

@@ -112,3 +112,34 @@ def test_admin_ship_wrong_status_returns_400(admin_client: TestClient, db_sessio
         json={"status": "shipped"},
     )
     assert response.status_code == 400
+
+
+def test_admin_cancel_already_cancelled_returns_400(admin_client: TestClient, db_session):
+    """Cancel on already-cancelled order must not issue a second refund."""
+    order, _ = make_order_for_admin(db_session, status=OrderStatus.cancelled)
+
+    with patch("app.api.v1.endpoints.admin_orders.create_refund") as mock_refund:
+        response = admin_client.post(f"/api/v1/admin/orders/{order.id}/cancel")
+
+    assert response.status_code == 400
+    mock_refund.assert_not_called()  # No refund issued
+
+
+def test_admin_deliver_order(admin_client: TestClient, db_session):
+    """PATCH status=delivered transitions shipped → delivered."""
+    order, _ = make_order_for_admin(db_session, status=OrderStatus.shipped)
+
+    response = admin_client.patch(
+        f"/api/v1/admin/orders/{order.id}/status",
+        json={"status": "delivered"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "delivered"
+
+
+def test_admin_ship_nonexistent_order_returns_404(admin_client: TestClient):
+    response = admin_client.patch(
+        f"/api/v1/admin/orders/{uuid.uuid4()}/status",
+        json={"status": "shipped"},
+    )
+    assert response.status_code == 404

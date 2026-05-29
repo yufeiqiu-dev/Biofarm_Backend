@@ -19,11 +19,9 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
 
-    pi_id = event.data.object.id
-
     if event.type == "payment_intent.succeeded":
-        confirm_order(db, pi_id)
+        confirm_order(db, event.data.object.id)
     elif event.type == "payment_intent.payment_failed":
-        cancel_order_from_failed_payment(db, pi_id)
+        cancel_order_from_failed_payment(db, event.data.object.id)
 
     return {"status": "ok"}
