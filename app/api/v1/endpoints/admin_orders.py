@@ -1,0 +1,134 @@
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.dependencies.auth import require_admin
+from app.models.order import OrderStatus
+from app.models.product_variant import ProductVariant
+from app.schemas.order import AdminOrderItemOut, AdminOrderOut, UpdateOrderStatusRequest
+from app.services.order_service import (
+    cancel_order,
+    deliver_order,
+    get_order_by_id,
+    list_all_orders,
+    ship_order,
+)
+from app.services.stripe_service import create_refund
+
+router = APIRouter(prefix="/admin/orders", tags=["admin-orders"])
+
+
+def _enrich_items_with_stock(order, db: Session):
+    enriched = []
+    for item in order.items:
+        current_stock = None
+        if item.variant_id:
+            variant = db.get(ProductVariant, item.variant_id)
+            if variant:
+                current_stock = variant.stock
+        enriched.append(
+            AdminOrderItemOut(
+                id=item.id,
+                variant_id=item.variant_id,
+                product_name=item.product_name,
+                variant_label=item.variant_label,
+                unit_price=item.unit_price,
+                quantity=item.quantity,
+                current_stock=current_stock,
+            )
+        )
+    return enriched
+
+
+def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
+    items = _enrich_items_with_stock(order, db)
+    return AdminOrderOut(
+        id=order.id,
+        order_number=order.order_number,
+        user_id=order.user_id,
+        status=order.status,
+        stripe_payment_intent_id=order.stripe_payment_intent_id,
+        total_amount=order.total_amount,
+        shipping_name=order.shipping_name,
+        shipping_phone=order.shipping_phone,
+        shipping_address1=order.shipping_address1,
+        shipping_address2=order.shipping_address2,
+        shipping_city=order.shipping_city,
+        shipping_state=order.shipping_state,
+        shipping_zip=order.shipping_zip,
+        notes=order.notes,
+        created_at=order.created_at,
+        updated_at=order.updated_at,
+        items=items,
+    )
+
+
+@router.get("", response_model=list[AdminOrderOut])
+def list_orders(
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    order_status = None
+    if status:
+        try:
+            order_status = OrderStatus(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+    orders = list_all_orders(db, order_status)
+    return [_build_admin_order_out(o, db) for o in orders]
+
+
+@router.get("/{order_id}", response_model=AdminOrderOut)
+def get_order(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    order = get_order_by_id(db, order_id)
+    if order is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    return _build_admin_order_out(order, db)
+
+
+@router.patch("/{order_id}/status", response_model=AdminOrderOut)
+def update_order_status(
+    order_id: uuid.UUID,
+    payload: UpdateOrderStatusRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    try:
+        if payload.status == "shipped":
+            order = ship_order(db, order_id)
+        else:
+            order = deliver_order(db, order_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return _build_admin_order_out(order, db)
+
+
+@router.post("/{order_id}/cancel", response_model=AdminOrderOut)
+def cancel_order_endpoint(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    order = get_order_by_id(db, order_id)
+    if order is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    try:
+        create_refund(order.stripe_payment_intent_id)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe refund failed: {e}")
+
+    try:
+        order = cancel_order(db, order_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return _build_admin_order_out(order, db)
