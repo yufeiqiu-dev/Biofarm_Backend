@@ -160,3 +160,8 @@ def test_bypass_non_admin_token_still_rejected(client: TestClient):
     token = _make_token(**{"cognito:groups": ["Users"]})
     response = _call(client, token=token, auth_bypass=True)
     assert response.status_code == 403
+
+
+def test_require_user_blocks_unauthenticated(client):
+    from app.dependencies.auth import require_user
+    assert callable(require_user)

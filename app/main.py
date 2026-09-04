@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.db.base import Base
-from app.db.session import engine
+from app.db.session import engine, SessionLocal
 
 import app.models
 
@@ -14,6 +14,9 @@ import app.models
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        from app.services.order_service import cleanup_stale_checkout_sessions
+        cleanup_stale_checkout_sessions(db)
     yield
 
 settings = get_settings()
