@@ -11,8 +11,9 @@ from app.services.s3_service import (
     MAX_IMAGES_PER_PRODUCT,
     delete_s3_objects_by_urls,
     generate_presigned_upload_url,
-    get_image_url,
     get_product_url_prefix,
+    key_to_url,
+    new_image_key,
 )
 
 router = APIRouter(
@@ -62,11 +63,12 @@ def get_presigned_url(
         )
 
     ext = payload.extension.lower()
-    next_index = current_count + 1
-    upload_url = generate_presigned_upload_url(product_id, next_index, ext)
-    image_url = get_image_url(product_id, next_index, ext)
+    key = new_image_key(product_id, ext)
 
-    return PresignedUrlResponse(upload_url=upload_url, image_url=image_url, index=next_index)
+    return PresignedUrlResponse(
+        upload_url=generate_presigned_upload_url(key, ext),
+        image_url=key_to_url(key),
+    )
 
 
 @router.post("/confirm", status_code=status.HTTP_200_OK)
@@ -98,7 +100,14 @@ def confirm_upload(
     return {"image_urls": current_urls}
 
 
-@router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("", status_code=status.HTTP_204_NO_CONTENT)
+# The route was registered only at "/", so the real path was
+# /admin/products/{id}/images/ and a call without the trailing slash earned a
+# 307. A redirected DELETE also needs its own CORS preflight, which is a
+# cross-origin failure waiting for the first caller that omits the slash.
+# Serving both means the frontend can drop its trailing slash independently,
+# rather than the two repos having to deploy together.
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, include_in_schema=False)
 def delete_image(
     product_id: UUID,
     payload: DeleteImageRequest,

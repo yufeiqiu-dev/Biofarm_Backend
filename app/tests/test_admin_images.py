@@ -21,15 +21,18 @@ FAKE_UPLOAD_URL = "https://s3.amazonaws.com/bucket/presigned"
 FAKE_CF_URL = "https://test.cloudfront.net"
 
 
-def _patch_s3(presigned_url: str = FAKE_UPLOAD_URL, cf_url: str = FAKE_CF_URL):
-    """Context manager that patches s3_service so no real AWS calls happen."""
-    mock_generate = MagicMock(return_value=presigned_url)
-    mock_delete = MagicMock()
-    mock_get_url = MagicMock(side_effect=lambda product_id, index, ext: f"{cf_url}/products/{product_id}/{index}.{ext}")
+def _patch_s3(presigned_url: str = FAKE_UPLOAD_URL):
+    """Patch out the two calls that would reach AWS.
+
+    new_image_key and key_to_url are deliberately left real: the key scheme is
+    what these tests are mostly about, and stubbing it would test the stub.
+    """
     return (
-        patch("app.api.v1.endpoints.admin_images.generate_presigned_upload_url", mock_generate),
-        patch("app.api.v1.endpoints.admin_images.delete_s3_objects_by_urls", mock_delete),
-        patch("app.api.v1.endpoints.admin_images.get_image_url", mock_get_url),
+        patch(
+            "app.api.v1.endpoints.admin_images.generate_presigned_upload_url",
+            MagicMock(return_value=presigned_url),
+        ),
+        patch("app.api.v1.endpoints.admin_images.delete_s3_objects_by_urls", MagicMock()),
     )
 
 
@@ -41,8 +44,8 @@ def test_presigned_url_success(admin_client: TestClient, db_session):
     db_session.commit()
     db_session.refresh(product)
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.post(
             f"/api/v1/admin/products/{product.id}/images/presigned-url",
             json={"extension": "jpg"},
@@ -51,30 +54,33 @@ def test_presigned_url_success(admin_client: TestClient, db_session):
     assert response.status_code == 200
     data = response.json()
     assert data["upload_url"] == FAKE_UPLOAD_URL
-    assert data["index"] == 1
-    assert "jpg" in data["image_url"]
+    assert data["image_url"].startswith(f"{FAKE_CF_URL}/products/{product.id}/")
+    assert data["image_url"].endswith(".jpg")
 
 
-def test_presigned_url_index_increments(admin_client: TestClient, db_session):
-    product = make_product("IMG-02", image_urls=[f"{FAKE_CF_URL}/products/x/1.jpg"])
+def test_presigned_url_keys_are_unique_per_call(admin_client: TestClient, db_session):
+    """Two presigns for the same product must never name the same object."""
+    product = make_product("IMG-02")
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
-        response = admin_client.post(
-            f"/api/v1/admin/products/{product.id}/images/presigned-url",
-            json={"extension": "png"},
-        )
+    p1, p2 = _patch_s3()
+    with p1, p2:
+        urls = {
+            admin_client.post(
+                f"/api/v1/admin/products/{product.id}/images/presigned-url",
+                json={"extension": "png"},
+            ).json()["image_url"]
+            for _ in range(25)
+        }
 
-    assert response.status_code == 200
-    assert response.json()["index"] == 2
+    assert len(urls) == 25
 
 
 def test_presigned_url_product_not_found(admin_client: TestClient):
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.post(
             f"/api/v1/admin/products/{uuid.uuid4()}/images/presigned-url",
             json={"extension": "jpg"},
@@ -88,8 +94,8 @@ def test_presigned_url_invalid_extension(admin_client: TestClient, db_session):
     db_session.commit()
     db_session.refresh(product)
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.post(
             f"/api/v1/admin/products/{product.id}/images/presigned-url",
             json={"extension": "gif"},
@@ -98,14 +104,14 @@ def test_presigned_url_invalid_extension(admin_client: TestClient, db_session):
 
 
 def test_presigned_url_max_images_reached(admin_client: TestClient, db_session):
-    urls = [f"{FAKE_CF_URL}/products/x/{i}.jpg" for i in range(1, 11)]  # 10 images
+    urls = [f"{FAKE_CF_URL}/products/{uuid.uuid4()}/{i}.jpg" for i in range(1, 11)]  # 10 images
     product = make_product("IMG-04", image_urls=urls)
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.post(
             f"/api/v1/admin/products/{product.id}/images/presigned-url",
             json={"extension": "jpg"},
@@ -198,15 +204,15 @@ def test_confirm_upload_max_images_reached(admin_client: TestClient, db_session)
 # --- DELETE / (by URL) ---
 
 def test_delete_image_success(admin_client: TestClient, db_session):
-    url1 = f"{FAKE_CF_URL}/products/x/1.jpg"
-    url2 = f"{FAKE_CF_URL}/products/x/2.png"
+    url1 = f"{FAKE_CF_URL}/products/{uuid.uuid4()}/a1b2c3.jpg"
+    url2 = f"{FAKE_CF_URL}/products/{uuid.uuid4()}/d4e5f6.png"
     product = make_product("DEL-IMG-01", image_urls=[url1, url2])
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.request(
             "DELETE",
             f"/api/v1/admin/products/{product.id}/images/",
@@ -222,35 +228,35 @@ def test_delete_image_success(admin_client: TestClient, db_session):
 
 
 def test_delete_image_not_found_is_idempotent(admin_client: TestClient, db_session):
-    product = make_product("DEL-IMG-02", image_urls=[f"{FAKE_CF_URL}/products/x/1.jpg"])
+    product = make_product("DEL-IMG-02", image_urls=[f"{FAKE_CF_URL}/products/{uuid.uuid4()}/a1b2c3.jpg"])
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.request(
             "DELETE",
             f"/api/v1/admin/products/{product.id}/images/",
-            json={"image_url": "https://cdn.example.com/products/x/nonexistent.jpg"},
+            json={"image_url": f"{FAKE_CF_URL}/products/{uuid.uuid4()}/nonexistent.jpg"},
         )
 
     assert response.status_code == 204
 
 
 def test_delete_image_product_not_found(admin_client: TestClient):
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         response = admin_client.request(
             "DELETE",
             f"/api/v1/admin/products/{uuid.uuid4()}/images/",
-            json={"image_url": "https://cdn.example.com/products/x/1.jpg"},
+            json={"image_url": f"{FAKE_CF_URL}/products/{uuid.uuid4()}/a1b2c3.jpg"},
         )
     assert response.status_code == 404
 
 
 def test_delete_image_s3_failure_still_removes_from_db(admin_client: TestClient, db_session):
-    url = f"{FAKE_CF_URL}/products/x/1.jpg"
+    url = f"{FAKE_CF_URL}/products/{uuid.uuid4()}/a1b2c3.jpg"
     product = make_product("DEL-IMG-03", image_urls=[url])
     db_session.add(product)
     db_session.commit()
@@ -335,8 +341,8 @@ def test_confirm_accepts_the_url_presign_handed_out(admin_client: TestClient, db
     image_url that came back verbatim."""
     product = _stored_product(db_session, "OWN-05")
 
-    p1, p2, p3 = _patch_s3()
-    with p1, p2, p3:
+    p1, p2 = _patch_s3()
+    with p1, p2:
         presign = admin_client.post(
             f"/api/v1/admin/products/{product.id}/images/presigned-url",
             json={"extension": "png"},
@@ -347,3 +353,110 @@ def test_confirm_accepts_the_url_presign_handed_out(admin_client: TestClient, db
 
     assert response.status_code == 200
     assert response.json()["image_urls"] == [presign.json()["image_url"]]
+
+
+# --- key collisions after a delete (the P2-2 regression) ---
+
+def test_upload_after_deleting_a_middle_image_does_not_reuse_a_key(
+    admin_client: TestClient, db_session
+):
+    """The exact sequence that used to destroy an image.
+
+    Keys were products/{id}/{index}.{ext} with index = len(image_urls) + 1. With
+    three images, deleting the second left two, so the next upload computed
+    index 3 - the key the third image still occupies. The presigned PUT
+    overwrote it, and nothing anywhere recorded that it had happened: the row
+    still listed the right number of URLs, one of which now served the wrong
+    picture.
+    """
+    product = _stored_product(db_session, "COLLIDE-01")
+
+    def presign() -> str:
+        p1, p2 = _patch_s3()
+        with p1, p2:
+            response = admin_client.post(
+                f"/api/v1/admin/products/{product.id}/images/presigned-url",
+                json={"extension": "jpg"},
+            )
+        assert response.status_code == 200
+        url = response.json()["image_url"]
+        assert _confirm(admin_client, product.id, url).status_code == 200
+        return url
+
+    first, second, third = presign(), presign(), presign()
+
+    p1, p2 = _patch_s3()
+    with p1, p2:
+        deleted = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{product.id}/images",
+            json={"image_url": second},
+        )
+    assert deleted.status_code == 204
+
+    fourth = presign()
+
+    db_session.refresh(product)
+    assert product.image_urls == [first, third, fourth]
+    assert fourth != third, "the new upload took the key the third image is stored under"
+    assert len({first, second, third, fourth}) == 4
+
+
+def test_concurrent_presigns_do_not_share_a_key(admin_client: TestClient, db_session):
+    """Two admins uploading at once both read the same len(image_urls) and were
+    handed the same index, so the second PUT overwrote the first."""
+    product = _stored_product(db_session, "COLLIDE-02")
+
+    p1, p2 = _patch_s3()
+    with p1, p2:
+        first, second = (
+            admin_client.post(
+                f"/api/v1/admin/products/{product.id}/images/presigned-url",
+                json={"extension": "webp"},
+            ).json()["image_url"]
+            for _ in range(2)
+        )
+
+    assert first != second
+
+
+def test_delete_works_without_the_trailing_slash(admin_client: TestClient, db_session):
+    """The route was registered only at "/", so this path used to 307 - and a
+    redirected cross-origin DELETE needs its own preflight to survive."""
+    product = _stored_product(db_session, "SLASH-01")
+    url = f"{FAKE_CF_URL}/products/{product.id}/abc123.jpg"
+    product.image_urls = [url]
+    db_session.commit()
+
+    p1, p2 = _patch_s3()
+    with p1, p2:
+        response = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{product.id}/images",
+            json={"image_url": url},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 204
+    db_session.refresh(product)
+    assert product.image_urls == []
+
+
+def test_delete_still_works_with_the_trailing_slash(admin_client: TestClient, db_session):
+    """The path the deployed frontend sends today. Both must work, or the two
+    repos have to deploy in lockstep."""
+    product = _stored_product(db_session, "SLASH-02")
+    url = f"{FAKE_CF_URL}/products/{product.id}/abc123.jpg"
+    product.image_urls = [url]
+    db_session.commit()
+
+    p1, p2 = _patch_s3()
+    with p1, p2:
+        response = admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/products/{product.id}/images/",
+            json={"image_url": url},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 204

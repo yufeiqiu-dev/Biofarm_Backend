@@ -260,3 +260,42 @@ def test_admin_ship_nonexistent_order_returns_404(admin_client: TestClient):
         json={"status": "shipped"},
     )
     assert response.status_code == 404
+
+
+# --- the status query parameter ---
+
+def test_status_filter_still_answers_to_the_status_query_parameter(admin_client, db_session):
+    """The handler's parameter was renamed to status_filter because `status`
+    shadowed the fastapi status module - which is why this one function had to
+    hardcode 400 where every sibling uses the constant. The URL contract is
+    unchanged, and this is what proves it."""
+    from app.models.order import OrderStatus
+    from app.tests.test_orders import make_order
+
+    make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+    make_order(db_session, status=OrderStatus.delivered)
+
+    response = admin_client.get("/api/v1/admin/orders?status=delivered")
+
+    assert response.status_code == 200
+    assert [o["status"] for o in response.json()] == ["delivered"]
+
+
+def test_an_unknown_status_is_a_400_from_the_shared_constant(admin_client):
+    response = admin_client.get("/api/v1/admin/orders?status=not-a-status")
+
+    assert response.status_code == 400
+    assert "not-a-status" in response.json()["detail"]
+
+
+def test_no_status_returns_every_order(admin_client, db_session):
+    from app.models.order import OrderStatus
+    from app.tests.test_orders import make_order
+
+    make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+    make_order(db_session, status=OrderStatus.delivered)
+
+    response = admin_client.get("/api/v1/admin/orders")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 2

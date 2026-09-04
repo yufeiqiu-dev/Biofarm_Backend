@@ -32,7 +32,7 @@ os.environ.update(
 )
 
 import pytest  # noqa: E402
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, event  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -48,6 +48,21 @@ TEST_DATABASE_URL = "sqlite:///:memory:"
 @pytest.fixture(scope="session")
 def test_engine():
     engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
+
+    # pysqlite ships with legacy transaction handling: it opens transactions
+    # implicitly and at the wrong moments, and it will not emit BEGIN for DDL or
+    # SAVEPOINT. The consequence here is that SAVEPOINT silently does nothing,
+    # which is the whole mechanism db_session relies on to let application code
+    # commit and roll back without escaping the test. SQLAlchemy's documented
+    # remedy is to take the BEGIN over from the driver.
+    @event.listens_for(engine, "connect")
+    def _disable_pysqlite_implicit_begin(dbapi_connection, connection_record):
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _emit_begin(conn):
+        conn.exec_driver_sql("BEGIN")
+
     Base.metadata.create_all(bind=engine)
     yield engine
     Base.metadata.drop_all(bind=engine)
@@ -55,9 +70,22 @@ def test_engine():
 
 @pytest.fixture()
 def db_session(test_engine):
+    """A session whose work is discarded when the test ends.
+
+    join_transaction_mode="create_savepoint" is what makes this honest. Without
+    it the session's commit() and rollback() acted on the outer transaction
+    directly: a service that rolled back - the order-number retry, any
+    IntegrityError path - destroyed everything the test had committed before it,
+    so the state an assertion then read was not the state the code produced.
+    It was also the source of the "transaction already deassociated" warning
+    this fixture used to emit on teardown.
+
+    With a savepoint, commit() and rollback() inside application code behave the
+    way they do against a real database, and only this outer rollback undoes it.
+    """
     connection = test_engine.connect()
     transaction = connection.begin()
-    Session = sessionmaker(bind=connection)
+    Session = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
     session = Session()
     yield session
     session.close()

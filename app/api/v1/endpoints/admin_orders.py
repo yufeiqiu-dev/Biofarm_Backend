@@ -1,7 +1,8 @@
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -24,8 +25,6 @@ router = APIRouter(prefix="/admin/orders", tags=["admin-orders"])
 
 
 def _enrich_items_with_stock(order, db: Session):
-    from sqlalchemy import select
-
     variant_ids = [item.variant_id for item in order.items if item.variant_id]
     stock_map: dict = {}
     if variant_ids:
@@ -78,16 +77,23 @@ def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
 
 @router.get("", response_model=list[AdminOrderOut])
 def list_orders(
-    status: Optional[str] = None,
+    # Named status_filter because a parameter called `status` shadows the
+    # fastapi `status` module imported above - which is why this function alone
+    # had to hardcode 400 where every sibling uses the constant. The alias keeps
+    # the query string unchanged.
+    status_filter: Optional[str] = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
     order_status = None
-    if status:
+    if status_filter:
         try:
-            order_status = OrderStatus(status)
+            order_status = OrderStatus(status_filter)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status: {status_filter}",
+            )
     orders = list_all_orders(db, order_status)
     return [_build_admin_order_out(o, db) for o in orders]
 

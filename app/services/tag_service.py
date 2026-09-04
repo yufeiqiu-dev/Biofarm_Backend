@@ -16,7 +16,7 @@ def get_tag_by_id(db: Session, tag_id: UUID) -> Tag | None:
 
 
 def create_tag(db: Session, payload: TagCreate) -> Tag:
-    tag = Tag(name=payload.name.strip())
+    tag = Tag(name=payload.name)
     db.add(tag)
     db.commit()
     db.refresh(tag)
