@@ -109,13 +109,41 @@ def test_webhook_pi_cancelled_deletes_session(client, db_session):
     assert order is None
 
 
-def test_webhook_payment_succeeded_no_session_is_noop(client, db_session):
-    """Duplicate or late payment_intent.succeeded with no session is a safe no-op."""
+def test_webhook_payment_succeeded_after_order_exists_is_noop(client, db_session):
+    """A duplicate or late event whose order already exists is a safe no-op.
+
+    Both amount_capturable_updated and succeeded reach the same handler, and the
+    first consumes the checkout session, so the second legitimately finds none.
+    That is the normal path, not a failure.
+    """
+    variant = make_product_and_variant(db_session)
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    first = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
+    assert first.status_code == 200
+
+    # Session is gone now; the order it became stands in for it.
+    second = post_webhook(client, pi_id, "payment_intent.succeeded")
+
+    assert second.status_code == 200
+    assert db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).count() == 1
+
+
+def test_webhook_payment_succeeded_with_no_session_and_no_order_fails(client, db_session):
+    """A paid intent with nothing behind it must not be reported as handled.
+
+    No checkout session and no order means the customer was charged and there is
+    nothing to fulfil. Answering 200 would tell Stripe the event was processed
+    and burn the retry that is the only free recovery mechanism available, so
+    this has to fail loudly instead.
+    """
     pi_id = f"pi_{uuid.uuid4().hex}"
 
     response = post_webhook(client, pi_id, "payment_intent.succeeded")
 
-    assert response.status_code == 200
+    assert response.status_code == 500
+    assert db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).count() == 0
 
 
 def test_webhook_payment_failed_is_noop(client, db_session):

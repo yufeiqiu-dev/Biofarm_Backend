@@ -5,18 +5,22 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import get_settings
-from app.db.base import Base
-from app.db.session import engine, SessionLocal
 
-import app.models
+import app.models  # noqa: F401 - registers ORM models on Base.metadata
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    with SessionLocal() as db:
-        from app.services.order_service import cleanup_stale_checkout_sessions
-        cleanup_stale_checkout_sessions(db)
+    """Startup and shutdown.
+
+    Deliberately empty. The schema is owned by Alembic and applied with
+    `alembic upgrade head` before the app starts; a `create_all` here would be a
+    second, silently diverging owner of the same tables. Stale checkout sessions
+    are swept by `app.jobs.cleanup` on a schedule rather than on every boot -
+    it is daily housekeeping, not startup work, and running it here meant a
+    table scan and delete at the exact moment the service was trying to become
+    healthy.
+    """
     yield
 
 settings = get_settings()

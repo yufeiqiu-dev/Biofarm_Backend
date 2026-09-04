@@ -1,5 +1,9 @@
 from functools import lru_cache
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PRODUCTION_ENVS = {"prod", "production"}
 
 
 class Settings(BaseSettings):
@@ -32,6 +36,40 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def _refuse_unsafe_production_config(self) -> "Settings":
+        """Refuse to start a production app with development shortcuts enabled.
+
+        Both bypasses are catastrophic in production and neither has a visible
+        symptom: with auth_bypass, every request arriving without an
+        Authorization header is treated as an admin, so the whole admin API is
+        open to anyone who finds the URL; with stripe_bypass, checkout creates
+        orders inline without ever charging a card. A copied .env or a stale
+        task definition is all it takes, and the app would otherwise come up
+        looking perfectly healthy.
+
+        Failing to boot is the point. A deployment that will not start gets
+        noticed within minutes; one that starts wide open does not.
+        """
+        if self.app_env.lower() not in PRODUCTION_ENVS:
+            return self
+
+        problems = []
+        if self.auth_bypass:
+            problems.append("AUTH_BYPASS must be false (it makes every unauthenticated request an admin)")
+        if self.stripe_bypass:
+            problems.append("STRIPE_BYPASS must be false (it creates orders without charging)")
+        if not self.stripe_secret_key:
+            problems.append("STRIPE_SECRET_KEY is required")
+        if not self.stripe_webhook_secret:
+            problems.append("STRIPE_WEBHOOK_SECRET is required (orders are created by the webhook)")
+
+        if problems:
+            raise ValueError(
+                f"Unsafe configuration for APP_ENV={self.app_env!r}: " + "; ".join(problems)
+            )
+        return self
 
 
 @lru_cache

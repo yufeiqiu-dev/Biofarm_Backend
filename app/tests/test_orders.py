@@ -89,10 +89,24 @@ def make_stripe_pi_mock(client_secret: str = "pi_test_secret_xxx"):
     return mock
 
 
+def make_tax_mock(subtotal_cents: int, rate: float = 0.0875):
+    """Stand in for Stripe Tax, mirroring the shape calculate_tax returns."""
+    tax = round(subtotal_cents * rate)
+    mock = MagicMock()
+    mock.tax_amount_cents = tax
+    mock.total_cents = subtotal_cents + tax
+    return mock
+
+
 def test_create_payment_intent_success(user_client: TestClient, db_session):
     _, variant = make_product_with_variant(db_session, "CART-PROD-1", price=15.0, stock=10)
 
-    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()) as mock_pi:
+    # calculate_tax must be patched alongside create_payment_intent: with
+    # STRIPE_BYPASS off (as the suite now pins it) it is a live Stripe Tax call,
+    # and the endpoint turns any failure into a 502 before the assertions below
+    # are ever reached.
+    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()) as mock_pi, \
+         patch("app.api.v1.endpoints.orders.calculate_tax", return_value=make_tax_mock(3000)):
         response = user_client.post("/api/v1/orders/payment-intent", json={
             "cart": [{"variant_id": str(variant.id), "quantity": 2}],
             "shipping": {
