@@ -22,6 +22,13 @@ def _s3_client():
     )
 
 
+def get_product_url_prefix(product_id: UUID) -> str:
+    """Every image URL for a product starts with this. Used to reject URLs that
+    were not produced by generate_presigned_upload_url."""
+    settings = get_settings()
+    return f"{settings.cloudfront_url.rstrip('/')}/products/{product_id}/"
+
+
 def get_image_key(product_id: UUID, index: int, ext: str) -> str:
     return f"products/{product_id}/{index}.{ext}"
 

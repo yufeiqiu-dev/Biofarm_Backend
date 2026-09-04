@@ -15,7 +15,10 @@ def make_product(cat_id: str, image_urls: list[str] | None = None) -> Product:
 
 
 FAKE_UPLOAD_URL = "https://s3.amazonaws.com/bucket/presigned"
-FAKE_CF_URL = "https://cdn.example.com"
+
+# Must match CLOUDFRONT_URL in conftest: confirm_upload rejects any URL outside
+# it, so a made-up host here would test the rejection rather than the append.
+FAKE_CF_URL = "https://test.cloudfront.net"
 
 
 def _patch_s3(presigned_url: str = FAKE_UPLOAD_URL, cf_url: str = FAKE_CF_URL):
@@ -155,11 +158,14 @@ def test_confirm_upload_product_not_found(admin_client: TestClient):
 
 
 def test_confirm_upload_idempotent(admin_client: TestClient, db_session):
-    image_url = f"{FAKE_CF_URL}/products/x/1.jpg"
-    product = make_product("CONF-04", image_urls=[image_url])
+    product = make_product("CONF-04")
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
+
+    image_url = f"{FAKE_CF_URL}/products/{product.id}/1.jpg"
+    product.image_urls = [image_url]
+    db_session.commit()
 
     response = admin_client.post(
         f"/api/v1/admin/products/{product.id}/images/confirm",
@@ -171,17 +177,22 @@ def test_confirm_upload_idempotent(admin_client: TestClient, db_session):
 
 
 def test_confirm_upload_max_images_reached(admin_client: TestClient, db_session):
-    urls = [f"{FAKE_CF_URL}/products/x/{i}.jpg" for i in range(1, 11)]  # 10 images
-    product = make_product("CONF-03", image_urls=urls)
+    product = make_product("CONF-03")
     db_session.add(product)
     db_session.commit()
     db_session.refresh(product)
 
+    product.image_urls = [f"{FAKE_CF_URL}/products/{product.id}/{i}.jpg" for i in range(1, 11)]
+    db_session.commit()
+
+    # A URL that passes the ownership check, so this tests the cap and not the
+    # ownership rejection - both answer 400 and would otherwise be confusable.
     response = admin_client.post(
         f"/api/v1/admin/products/{product.id}/images/confirm",
-        json={"image_url": "https://example.com/11.jpg"},
+        json={"image_url": f"{FAKE_CF_URL}/products/{product.id}/11.jpg"},
     )
     assert response.status_code == 400
+    assert "maximum" in response.json()["detail"]
 
 
 # --- DELETE / (by URL) ---
@@ -256,3 +267,83 @@ def test_delete_image_s3_failure_still_removes_from_db(admin_client: TestClient,
     assert response.status_code == 204
     db_session.refresh(product)
     assert product.image_urls == []
+
+
+# --- confirm rejects URLs the backend never handed out ---
+
+def _confirm(admin_client: TestClient, product_id, image_url: str):
+    return admin_client.post(
+        f"/api/v1/admin/products/{product_id}/images/confirm",
+        json={"image_url": image_url},
+    )
+
+
+def _stored_product(db_session, cat_id: str):
+    product = make_product(cat_id)
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+    return product
+
+
+def test_confirm_rejects_offdomain_url(admin_client: TestClient, db_session):
+    """image_urls is rendered on the public product page, so an unchecked value
+    here embeds an arbitrary third-party URL in the storefront - and one that
+    delete can never clean up, since _url_to_key ignores anything off-domain."""
+    product = _stored_product(db_session, "OWN-01")
+
+    response = _confirm(admin_client, product.id, f"https://evil.example.com/products/{product.id}/1.jpg")
+
+    assert response.status_code == 400
+    assert "does not belong" in response.json()["detail"]
+    db_session.refresh(product)
+    assert product.image_urls == []
+
+
+def test_confirm_rejects_another_products_url(admin_client: TestClient, db_session):
+    """Right domain, wrong product - deleting product A would then delete an
+    object product B's row still points at."""
+    product = _stored_product(db_session, "OWN-02")
+    other_id = uuid.uuid4()
+
+    response = _confirm(admin_client, product.id, f"{FAKE_CF_URL}/products/{other_id}/1.jpg")
+
+    assert response.status_code == 400
+
+
+def test_confirm_rejects_path_outside_the_products_prefix(admin_client: TestClient, db_session):
+    product = _stored_product(db_session, "OWN-03")
+
+    response = _confirm(admin_client, product.id, f"{FAKE_CF_URL}/../../etc/passwd")
+
+    assert response.status_code == 400
+
+
+def test_confirm_rejects_prefix_lookalike_host(admin_client: TestClient, db_session):
+    """startswith on the bare host would accept test.cloudfront.net.evil.com."""
+    product = _stored_product(db_session, "OWN-04")
+
+    response = _confirm(
+        admin_client, product.id, f"{FAKE_CF_URL}.evil.example.com/products/{product.id}/1.jpg"
+    )
+
+    assert response.status_code == 400
+
+
+def test_confirm_accepts_the_url_presign_handed_out(admin_client: TestClient, db_session):
+    """The round trip the frontend actually performs: presign, then confirm the
+    image_url that came back verbatim."""
+    product = _stored_product(db_session, "OWN-05")
+
+    p1, p2, p3 = _patch_s3()
+    with p1, p2, p3:
+        presign = admin_client.post(
+            f"/api/v1/admin/products/{product.id}/images/presigned-url",
+            json={"extension": "png"},
+        )
+    assert presign.status_code == 200
+
+    response = _confirm(admin_client, product.id, presign.json()["image_url"])
+
+    assert response.status_code == 200
+    assert response.json()["image_urls"] == [presign.json()["image_url"]]

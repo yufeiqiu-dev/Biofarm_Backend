@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     aws_access_key_id: str
     aws_secret_access_key: str
 
+    # The app client access tokens must have been issued to. Optional so a local
+    # .env predating this check still boots; required under APP_ENV=prod by the
+    # validator below, because without it any app client in the pool is accepted.
+    cognito_user_pool_client_id: str = ""
+
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
     stripe_bypass: bool = False  # When True, skip real Stripe API calls (dev/test mode)
@@ -64,6 +69,11 @@ class Settings(BaseSettings):
             problems.append("STRIPE_SECRET_KEY is required")
         if not self.stripe_webhook_secret:
             problems.append("STRIPE_WEBHOOK_SECRET is required (orders are created by the webhook)")
+        if not self.cognito_user_pool_client_id:
+            problems.append(
+                "COGNITO_USER_POOL_CLIENT_ID is required "
+                "(without it, a token from any app client in the pool is accepted)"
+            )
 
         if problems:
             raise ValueError(

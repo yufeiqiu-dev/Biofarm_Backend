@@ -34,9 +34,14 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Authentication is a bearer token in a header, never a cookie, so the
+    # browser has no credentials to send cross-origin. Leaving this on asked for
+    # a privilege the app does not use and cannot benefit from.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    # The only three the frontend sends. X-Id-Token carries the id token the
+    # checkout endpoint reads the customer email from.
+    allow_headers=["Authorization", "Content-Type", "X-Id-Token"],
 )
 
 app.include_router(api_router, prefix=settings.api_v1_prefix)

@@ -12,6 +12,7 @@ from app.services.s3_service import (
     delete_s3_objects_by_urls,
     generate_presigned_upload_url,
     get_image_url,
+    get_product_url_prefix,
 )
 
 router = APIRouter(
@@ -25,6 +26,23 @@ def _get_product_or_404(db: Session, product_id: UUID):
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     return product
+
+
+def _require_own_image_url(product_id: UUID, image_url: str) -> None:
+    """Reject any URL this backend did not hand out for this product.
+
+    image_urls is written straight into the product row and rendered on the
+    public product page, so an unchecked value here is an arbitrary off-domain
+    URL embedded in the storefront. It is also unrecoverable: _url_to_key in
+    s3_service returns None for anything outside the CloudFront domain, so such
+    an entry can never be cleaned up by the delete path.
+    """
+    prefix = get_product_url_prefix(product_id)
+    if not image_url.startswith(prefix):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="image_url does not belong to this product",
+        )
 
 
 @router.post("/presigned-url", response_model=PresignedUrlResponse, status_code=status.HTTP_200_OK)
@@ -59,6 +77,7 @@ def confirm_upload(
     _: dict = Depends(require_admin),
 ):
     product = _get_product_or_404(db, product_id)
+    _require_own_image_url(product_id, payload.image_url)
 
     current_urls = list(product.image_urls or [])
 

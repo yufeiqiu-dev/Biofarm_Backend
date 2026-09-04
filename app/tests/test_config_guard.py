@@ -31,6 +31,7 @@ SAFE_PROD = {
     "stripe_bypass": False,
     "stripe_secret_key": "sk_test_x",
     "stripe_webhook_secret": "whsec_x",
+    "cognito_user_pool_client_id": "1h2j3k4l5m6n7o8p9q0r",
 }
 
 
@@ -64,6 +65,20 @@ def test_production_requires_stripe_keys():
     # missing signing secret means every payment silently fails to become one.
     with pytest.raises(ValidationError, match="STRIPE_WEBHOOK_SECRET"):
         Settings(**{**SAFE_PROD, "stripe_webhook_secret": ""})
+
+
+def test_production_requires_the_app_client_id():
+    """Without it, _verify_access_token skips the client_id check and accepts a
+    token issued to any app client in the pool - including one added later for
+    something else entirely."""
+    with pytest.raises(ValidationError, match="COGNITO_USER_POOL_CLIENT_ID"):
+        Settings(**{**SAFE_PROD, "cognito_user_pool_client_id": ""})
+
+
+def test_development_does_not_require_the_app_client_id():
+    """A local .env written before this check existed must still boot."""
+    settings = Settings(**BASE, app_env="dev", cognito_user_pool_client_id="")
+    assert settings.cognito_user_pool_client_id == ""
 
 
 @pytest.mark.parametrize("env", ["prod", "PROD", "production", "Production"])

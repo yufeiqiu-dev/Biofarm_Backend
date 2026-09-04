@@ -20,6 +20,7 @@ os.environ.update(
         "DATABASE_URL": "sqlite:///:memory:",
         "COGNITO_REGION": "us-east-2",
         "COGNITO_USER_POOL_ID": "us-east-2_test",
+        "COGNITO_USER_POOL_CLIENT_ID": "test-app-client-id",
         "AWS_REGION": "us-east-2",
         "S3_BUCKET_NAME": "test-bucket",
         "CLOUDFRONT_URL": "https://test.cloudfront.net",
