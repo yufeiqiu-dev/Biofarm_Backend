@@ -1,0 +1,15 @@
+# Files that run inside a Linux container must keep LF endings regardless of the
+# machine they are checked out on.
+#
+# Windows sets core.autocrlf=true by default, which rewrites LF to CRLF on
+# checkout. A shell script that arrives with CRLF has a shebang of
+# "#!/bin/sh\r", and the kernel looks for an interpreter literally named
+# "/bin/sh\r". The container then fails with "no such file or directory" naming
+# the entrypoint that plainly exists - one of the more misleading errors in
+# Docker, and worth a rule to never meet.
+
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
