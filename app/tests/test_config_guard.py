@@ -95,3 +95,63 @@ def test_all_problems_reported_together():
     message = str(exc.value)
     assert "AUTH_BYPASS" in message
     assert "STRIPE_BYPASS" in message
+
+
+# --- Stripe mode ---
+#
+# Both mixups below leave an application that starts, serves traffic and looks
+# entirely healthy. Only the money is wrong.
+
+TEST_MODE = {**BASE, "stripe_bypass": False, "stripe_mode": "test", "stripe_secret_key": "sk_test_abc"}
+LIVE_MODE = {**SAFE_PROD, "stripe_mode": "live", "stripe_secret_key": "sk_live_abc"}
+
+
+def test_matching_test_mode_boots():
+    assert Settings(**TEST_MODE).stripe_mode == "test"
+
+
+def test_matching_live_mode_boots():
+    assert Settings(**LIVE_MODE).stripe_mode == "live"
+
+
+def test_a_live_key_in_a_test_environment_is_refused():
+    """Staging with live keys charges real cards for every test order, and
+    nothing on the application side looks any different."""
+    with pytest.raises(ValidationError, match="live key"):
+        Settings(**{**TEST_MODE, "stripe_secret_key": "sk_live_abc"})
+
+
+def test_a_test_key_in_production_is_refused():
+    """The worse of the two: every order succeeds and no money is ever taken,
+    silently, until someone reconciles orders against the Stripe ledger."""
+    with pytest.raises(ValidationError, match="test key"):
+        Settings(**{**LIVE_MODE, "stripe_secret_key": "sk_test_abc"})
+
+
+def test_an_unrecognised_key_is_refused():
+    with pytest.raises(ValidationError, match="neither test nor live"):
+        Settings(**{**TEST_MODE, "stripe_secret_key": "rk_live_restricted"})
+
+
+def test_an_invalid_mode_is_refused():
+    with pytest.raises(ValidationError, match="STRIPE_MODE"):
+        Settings(**{**TEST_MODE, "stripe_mode": "sandbox"})
+
+
+def test_the_mode_is_case_insensitive():
+    """APP_ENV already had this problem; no reason to repeat it here."""
+    assert Settings(**{**LIVE_MODE, "stripe_mode": "LIVE"})
+
+
+def test_bypass_skips_the_check_entirely():
+    """No key is used at all under bypass, so there is nothing to be consistent
+    with - and local development should not have to declare a mode."""
+    settings = Settings(**BASE, stripe_bypass=True, stripe_mode="live", stripe_secret_key="")
+    assert settings.stripe_bypass is True
+
+
+def test_an_absent_key_is_left_to_the_production_guard():
+    """Empty is a different failure with a different message; this validator
+    should not pre-empt it and report the wrong problem."""
+    with pytest.raises(ValidationError, match="STRIPE_SECRET_KEY is required"):
+        Settings(**{**LIVE_MODE, "stripe_secret_key": ""})
