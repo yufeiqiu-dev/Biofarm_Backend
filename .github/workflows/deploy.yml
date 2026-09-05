@@ -34,7 +34,9 @@ env:
   ECR_REPOSITORY: biofarm-backend
 
 jobs:
-  deploy:
+  # Split from `deploy` so the tests still run on every push to a deploying
+  # branch even before there is an account to deploy to.
+  test:
     runs-on: ubuntu-latest
 
     services:
@@ -89,6 +91,25 @@ jobs:
           CLOUDFRONT_URL: https://ci.cloudfront.net
           AWS_ACCESS_KEY_ID: ci
           AWS_SECRET_ACCESS_KEY: ci
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+
+    # Skipped until the account exists and AWS_DEPLOY_ROLE_ARN is set as a
+    # repository variable.
+    #
+    # Without this the job fails on every push to a deploying branch from now
+    # until the infrastructure is stood up, for a reason that is not a problem
+    # with the change being pushed. A workflow that is always red teaches you to
+    # stop reading it, which costs more than the signal it was giving.
+    #
+    # `test` above still runs either way, so a push to staging is never
+    # unverified - it is only undeployed.
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
+
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Resolve the target environment
         id: target
