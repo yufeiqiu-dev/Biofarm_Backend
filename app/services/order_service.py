@@ -12,6 +12,7 @@ from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
 from app.schemas.order import CartItemIn, ShippingIn
 from app.services.order_numbers import generate_order_number
+from app.services import email_service
 
 
 # How many times to re-roll an order number when the generated one is already
@@ -194,6 +195,11 @@ def create_order_from_checkout_session(
     db.delete(session)
     db.commit()
     db.refresh(order)
+
+    # After the commit, deliberately. The order is the thing that matters and it
+    # is already durable; email_service swallows its own failures so a bad send
+    # cannot turn into a non-200 back to Stripe and a retried, duplicated order.
+    email_service.send_order_confirmation(order)
     return order
 
 
@@ -287,6 +293,10 @@ def ship_order(db: Session, order_id: uuid.UUID, tracking_number: str | None = N
         order.tracking_number = tracking_number
     db.commit()
     db.refresh(order)
+
+    # The payment was captured before this status change, so the shipment has
+    # really happened; a failed email must not unwind it.
+    email_service.send_order_shipped(order)
     return order
 
 
@@ -332,6 +342,7 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)
+    email_service.send_order_cancelled(order)
     return order
 
 
@@ -344,6 +355,7 @@ def cancel_order_by_customer(db: Session, order_id: uuid.UUID, user_id: str) -> 
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)
+    email_service.send_order_cancelled(order)
     return order
 
 

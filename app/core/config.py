@@ -45,8 +45,15 @@ class Settings(BaseSettings):
     s3_bucket_name: str
     aws_region: str
     cloudfront_url: str  # e.g. https://d1234abcd.cloudfront.net
-    aws_access_key_id: str
-    aws_secret_access_key: SecretStr
+    # Optional, and empty is the right answer in a deployed environment.
+    #
+    # Locally there is an IAM user's key in .env, because a laptop has no role
+    # to assume. On App Runner there is an instance role, and boto3 finds it on
+    # its own as long as nothing hands it a key first - see app/core/aws.py.
+    # These were required until it turned out the App Runner stack sets neither,
+    # so the container could not start at all.
+    aws_access_key_id: str = ""
+    aws_secret_access_key: SecretStr = SecretStr("")
 
     # The app client access tokens must have been issued to. Optional so a local
     # .env predating this check still boots; required under APP_ENV=prod by the
@@ -56,6 +63,25 @@ class Settings(BaseSettings):
     stripe_secret_key: SecretStr = SecretStr("")
     stripe_webhook_secret: SecretStr = SecretStr("")
     stripe_bypass: bool = False  # When True, skip real Stripe API calls (dev/test mode)
+
+    email_bypass: bool = False
+    """When True, log the message instead of sending it.
+
+    The same shape as stripe_bypass, and for the same reason: local development
+    and the test suite must not put mail in front of real people, and SES in
+    sandbox refuses unverified recipients anyway.
+    """
+
+    email_from: str = ""
+    """The SES-verified From address. Required unless email_bypass is on.
+
+    SES will not send from an identity it has not verified, so this is the one
+    piece of email configuration that cannot have a sensible default.
+    """
+
+    email_reply_to: str = ""
+    """Optional. Where replies go if that is not the From address - a support
+    inbox a person actually reads, rather than a no-reply nobody watches."""
 
     # Which Stripe mode this deployment expects: "test" or "live". Staging runs
     # "test" against real Stripe, so the webhook, manual capture and refund paths
@@ -177,6 +203,13 @@ class Settings(BaseSettings):
             problems.append("AUTH_BYPASS must be false (it makes every unauthenticated request an admin)")
         if self.stripe_bypass:
             problems.append("STRIPE_BYPASS must be false (it creates orders without charging)")
+        if self.email_bypass:
+            problems.append(
+                "EMAIL_BYPASS must be false "
+                "(customers would be charged and never told their order exists)"
+            )
+        if not self.email_from:
+            problems.append("EMAIL_FROM is required (SES will not send from an unverified identity)")
         if not self.stripe_secret_key.get_secret_value():
             problems.append("STRIPE_SECRET_KEY is required")
         if not self.stripe_webhook_secret.get_secret_value():

@@ -32,6 +32,8 @@ SAFE_PROD = {
     "stripe_secret_key": "sk_test_x",
     "stripe_webhook_secret": "whsec_x",
     "cognito_user_pool_client_id": "1h2j3k4l5m6n7o8p9q0r",
+    "email_bypass": False,
+    "email_from": "orders@example.com",
 }
 
 
@@ -55,6 +57,22 @@ def test_production_refuses_auth_bypass():
 def test_production_refuses_stripe_bypass():
     with pytest.raises(ValidationError, match="STRIPE_BYPASS"):
         Settings(**{**SAFE_PROD, "stripe_bypass": True})
+
+
+def test_production_refuses_email_bypass():
+    """A store that charges a card and never says so is not a working store, and
+    the customer's only clue is silence."""
+    with pytest.raises(ValidationError, match="EMAIL_BYPASS"):
+        Settings(**{**SAFE_PROD, "email_bypass": True})
+
+
+def test_production_requires_a_verified_sender():
+    """Without EMAIL_FROM, SES rejects every message and email_service swallows
+    the failure by design - so the symptom is no mail at all and nothing in the
+    interface to suggest it. Refusing to boot is the only visible failure
+    available."""
+    with pytest.raises(ValidationError, match="EMAIL_FROM"):
+        Settings(**{**SAFE_PROD, "email_from": ""})
 
 
 def test_production_requires_stripe_keys():

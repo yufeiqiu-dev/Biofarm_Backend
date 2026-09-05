@@ -28,6 +28,14 @@ os.environ.update(
         "AWS_SECRET_ACCESS_KEY": "test-secret",
         "STRIPE_SECRET_KEY": "sk_test_dummy",
         "STRIPE_WEBHOOK_SECRET": "whsec_test_dummy",
+        # Bypassed for the suite at large, so no test can reach SES. Order
+        # tests ship and cancel orders, which now send mail, and without this
+        # they would each build a real boto3 client and attempt a network call -
+        # swallowed by email_service, so the tests would still pass while
+        # quietly depending on the network. test_email.py turns it off for
+        # itself, which is the only place assertions about sending belong.
+        "EMAIL_BYPASS": "true",
+        "EMAIL_FROM": "orders@test.invalid",
     }
 )
 
