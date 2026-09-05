@@ -62,7 +62,7 @@ class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    order_number: int
+    order_number: str
     status: OrderStatus
     total_amount: Money
     tax_amount: Money = Decimal("0")

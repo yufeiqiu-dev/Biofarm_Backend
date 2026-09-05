@@ -253,3 +253,100 @@ def test_null_groups_claim_returns_403_not_500(client: TestClient):
     token = _make_token(**{"cognito:groups": None})
     response = _call(client, token=token)
     assert response.status_code == 403
+
+
+# --- the id token behind X-Id-Token ---
+#
+# An access token carries no email claim, so checkout reads it from the id token
+# the frontend forwards. That value used to be decoded with the signature check
+# disabled - "only a hint, never an authorization decision". True of how it is
+# used, and beside the point: the email is written onto the order and shown in
+# the admin console, so an unverified claim let any signed-in customer put an
+# arbitrary address into the record fulfilment works from.
+
+def _id_token(**overrides) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": "user-123",
+        "iss": TEST_ISS,
+        "token_use": "id",
+        "aud": TEST_CLIENT_ID,
+        "email": "real@example.com",
+        "iat": now,
+        "exp": now + 3600,
+    }
+    payload.update(overrides)
+    return jwt.encode(payload, _private_key, algorithm="RS256")
+
+
+def _verify(token: str, client_id: str = TEST_CLIENT_ID):
+    from app.dependencies.auth import verify_id_token
+
+    with patch("app.dependencies.auth.get_settings", return_value=_settings_mock(client_id=client_id)):
+        with patch("app.dependencies.auth._jwks_client", return_value=_jwks_mock()):
+            return verify_id_token(token)
+
+
+def test_a_properly_signed_id_token_is_accepted():
+    claims = _verify(_id_token())
+    assert claims is not None
+    assert claims["email"] == "real@example.com"
+
+
+def test_an_unsigned_token_is_rejected():
+    """The exact forgery this closes: a customer crafts a token with their own
+    sub and any email they like, and signs it with nothing."""
+    forged = jwt.encode(
+        {
+            "sub": "user-123",
+            "iss": TEST_ISS,
+            "token_use": "id",
+            "aud": TEST_CLIENT_ID,
+            "email": "someone.else@example.com",
+            "exp": int(time.time()) + 3600,
+        },
+        "a-key-long-enough-to-not-warn-about-hmac-length",
+        algorithm="HS256",
+    )
+    assert _verify(forged) is None
+
+
+def test_a_token_signed_with_the_wrong_key_is_rejected():
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": "user-123",
+            "iss": TEST_ISS,
+            "token_use": "id",
+            "aud": TEST_CLIENT_ID,
+            "email": "attacker@example.com",
+            "exp": now + 3600,
+        },
+        _wrong_private_key,
+        algorithm="RS256",
+    )
+    assert _verify(token) is None
+
+
+def test_an_access_token_is_not_accepted_as_an_id_token():
+    """It is signed by the same pool and would pass every other check."""
+    assert _verify(_id_token(token_use="access")) is None
+
+
+def test_an_id_token_for_another_app_client_is_rejected():
+    """Unlike an access token, an id token carries `aud` - so this is the claim
+    that binds it to us."""
+    assert _verify(_id_token(aud="some-other-app-client")) is None
+
+
+def test_an_expired_id_token_is_rejected():
+    assert _verify(_id_token(exp=int(time.time()) - 3600)) is None
+
+
+def test_an_id_token_from_another_pool_is_rejected():
+    assert _verify(_id_token(iss="https://cognito-idp.us-west-2.amazonaws.com/other")) is None
+
+
+def test_a_malformed_token_returns_none_rather_than_raising():
+    """Checkout must not fail because the email could not be established."""
+    assert _verify("not-a-jwt-at-all") is None

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
+from app.services.order_numbers import generate_order_number
 
 
 def make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment, qty=1, stock=5):
@@ -20,9 +21,14 @@ def make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment, qt
     )
     product.variants.append(variant)
     db_session.add(product)
+    # Explicit, because the OrderItem below needs variant.id. This used to work
+    # only because the order_number expression ran a query, whose autoflush
+    # assigned the id as a side effect - so changing an unrelated line silently
+    # left variant_id as None and the stock assertions stopped meaning anything.
+    db_session.flush()
 
     order = Order(
-        order_number=3000 + db_session.query(Order).count(),
+        order_number=generate_order_number(),
         user_id="customer-sub-abc",
         status=status,
         stripe_payment_intent_id=f"pi_{uuid.uuid4().hex}",

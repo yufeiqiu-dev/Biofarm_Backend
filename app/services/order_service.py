@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -11,17 +11,14 @@ from app.models.checkout_session import CheckoutSession
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
 from app.schemas.order import CartItemIn, ShippingIn
+from app.services.order_numbers import generate_order_number
+from app.services import email_service
 
 
-# How many times to re-derive an order number when another transaction takes the
-# one we picked. Each retry re-reads the maximum, so the only way to exhaust this
-# is that many orders committing inside one request - far beyond this catalog.
+# How many times to re-roll an order number when the generated one is already
+# taken. Against 32^8 possibilities a single collision is already unlikely; five
+# in a row is not worth planning for beyond failing loudly.
 _ORDER_NUMBER_ATTEMPTS = 5
-
-
-def _next_order_number(db: Session) -> int:
-    max_num = db.scalar(select(func.max(Order.order_number)))
-    return (max_num or 999) + 1
 
 
 def _load_order(db: Session, order_id: uuid.UUID) -> Order | None:
@@ -80,7 +77,7 @@ def create_order(
             }
         )
 
-    def build(order_number: int) -> Order:
+    def build(order_number: str) -> Order:
         return Order(
             order_number=order_number,
             user_id=user_id,
@@ -102,16 +99,13 @@ def create_order(
             items=[OrderItem(**values) for values in item_values],
         )
 
-    # order_number is "max + 1" over a unique column, which is a race: two
-    # checkouts landing together read the same maximum and the second insert
-    # violates the constraint. Unhandled that is a 500 on a request whose card is
-    # already authorized - the customer is charged and has no order.
-    #
-    # Retrying re-reads the maximum, so the loser of the race simply takes the
-    # next number. Chosen over a database sequence because it needs no migration
-    # and behaves the same on the SQLite engine the tests run against.
+    # The number is random rather than derived from what other rows hold, so the
+    # old read-then-write race is gone entirely. The retry stays for the far
+    # rarer case of two generated values colliding, and because an unhandled
+    # IntegrityError here is a 500 on a request whose card is already authorized
+    # - the customer charged, with no order.
     for attempt in range(_ORDER_NUMBER_ATTEMPTS):
-        order = build(_next_order_number(db))
+        order = build(generate_order_number())
         db.add(order)
         try:
             db.commit()
@@ -141,15 +135,40 @@ def save_checkout_session(
     tax_amount_cents: int = 0,
     customer_email: str = "",
 ) -> CheckoutSession:
-    session = CheckoutSession(
-        stripe_pi_id=stripe_pi_id,
-        user_id=user_id,
-        customer_email=customer_email,
-        cart_json=json.dumps([{"variant_id": str(item.variant_id), "quantity": item.quantity} for item in cart]),
-        shipping_json=shipping.model_dump_json(),
-        tax_amount_cents=tax_amount_cents,
+    """Record the cart against a PaymentIntent, replacing any existing record.
+
+    Idempotent on purpose, and it has to be. Checkout sends Stripe an idempotency
+    key derived from the buyer and the cart, so a resubmitted checkout - a
+    double-clicked Pay button, a lost response, a browser retry - gets *the same*
+    PaymentIntent back. That is the point of the key: it stops a second
+    authorization hold on the customer's card.
+
+    But the same id then arrives here, where stripe_pi_id is unique. Inserting
+    blindly raised an IntegrityError and returned a 500, so the very retry the
+    idempotency key made safe at Stripe was fatal one layer down. The two halves
+    have to agree.
+
+    Updating rather than skipping matters too: the shipping address or the tax
+    may legitimately have changed between attempts, and the webhook builds the
+    order from whatever is stored here.
+    """
+    cart_json = json.dumps(
+        [{"variant_id": str(item.variant_id), "quantity": item.quantity} for item in cart]
     )
-    db.add(session)
+
+    session = db.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == stripe_pi_id)
+    )
+    if session is None:
+        session = CheckoutSession(stripe_pi_id=stripe_pi_id)
+        db.add(session)
+
+    session.user_id = user_id
+    session.customer_email = customer_email
+    session.cart_json = cart_json
+    session.shipping_json = shipping.model_dump_json()
+    session.tax_amount_cents = tax_amount_cents
+
     db.commit()
     db.refresh(session)
     return session
@@ -176,6 +195,11 @@ def create_order_from_checkout_session(
     db.delete(session)
     db.commit()
     db.refresh(order)
+
+    # After the commit, deliberately. The order is the thing that matters and it
+    # is already durable; email_service swallows its own failures so a bad send
+    # cannot turn into a non-200 back to Stripe and a retried, duplicated order.
+    email_service.send_order_confirmation(order)
     return order
 
 
@@ -269,6 +293,10 @@ def ship_order(db: Session, order_id: uuid.UUID, tracking_number: str | None = N
         order.tracking_number = tracking_number
     db.commit()
     db.refresh(order)
+
+    # The payment was captured before this status change, so the shipment has
+    # really happened; a failed email must not unwind it.
+    email_service.send_order_shipped(order)
     return order
 
 
@@ -314,6 +342,7 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)
+    email_service.send_order_cancelled(order)
     return order
 
 
@@ -326,6 +355,7 @@ def cancel_order_by_customer(db: Session, order_id: uuid.UUID, user_id: str) -> 
     order.status = OrderStatus.cancelled
     db.commit()
     db.refresh(order)
+    email_service.send_order_cancelled(order)
     return order
 
 

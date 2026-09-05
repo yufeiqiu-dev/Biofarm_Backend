@@ -1,30 +1,17 @@
-from functools import lru_cache
 from uuid import UUID, uuid4
 
-import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from app.core.aws import get_client
 from app.core.config import get_settings
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 MAX_IMAGES_PER_PRODUCT = 10
 
 
-@lru_cache
 def _s3_client():
-    """Cached: boto3 parses the full S3 service model on every client(), which is
-    tens of milliseconds paid on each presign, confirm and delete for no reason.
-    The client is thread-safe for the calls made here."""
-    settings = get_settings()
-    return boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-        endpoint_url=f"https://s3.{settings.aws_region}.amazonaws.com",
-        config=Config(signature_version="s3v4"),
-    )
+    return get_client("s3")
 
 
 def get_product_url_prefix(product_id: UUID) -> str:

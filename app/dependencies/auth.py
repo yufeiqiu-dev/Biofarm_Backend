@@ -89,6 +89,56 @@ def _verify_access_token(token: str) -> dict:
     return payload
 
 
+def verify_id_token(token: str) -> dict | None:
+    """Fully verify a Cognito *id* token, returning its claims or None.
+
+    The checkout endpoint needs the customer's email, and an access token has no
+    email claim - so the frontend forwards the id token in X-Id-Token. That value
+    used to be read with `verify_signature: False`, on the reasoning that it was
+    only a hint and never an authorization decision.
+
+    It is not only a hint. The email is persisted on the order and shown in the
+    admin console, so an unverified claim means any signed-in customer can write
+    an arbitrary address into the business record simply by sending their own
+    header - including another customer's, which is who fulfilment would then
+    contact.
+
+    Verifying properly costs nothing now that the app client id is configured.
+    Unlike an access token, an id token *does* carry `aud`, so it is checked here
+    rather than through the separate client_id claim.
+
+    Returns None rather than raising: the email is optional, and a checkout must
+    not fail because of it.
+    """
+    settings = get_settings()
+    client_id = settings.cognito_user_pool_client_id
+
+    try:
+        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=client_id or None,
+            options={"verify_aud": bool(client_id)},
+        )
+    except jwt.InvalidTokenError:
+        return None
+
+    expected_iss = (
+        f"https://cognito-idp.{settings.cognito_region}.amazonaws.com"
+        f"/{settings.cognito_user_pool_id}"
+    )
+    if payload.get("iss") != expected_iss:
+        return None
+
+    # An access token presented here would otherwise pass every other check.
+    if payload.get("token_use") != "id":
+        return None
+
+    return payload
+
+
 def _bearer_token(request: Request) -> str | None:
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):

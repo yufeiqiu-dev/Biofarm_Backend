@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
+from app.services.order_numbers import generate_order_number
 
 
 def make_product_with_variant(db_session, cat_id: str, price: float = 10.0, stock: int = 5):
@@ -29,7 +30,7 @@ def make_product_with_variant(db_session, cat_id: str, price: float = 10.0, stoc
 def make_order(db_session, user_id: str = "test-user-123", status: OrderStatus = OrderStatus.awaiting_fulfillment, stock: int = 5) -> tuple[Order, ProductVariant]:
     product, variant = make_product_with_variant(db_session, f"P-{uuid.uuid4().hex[:6]}", stock=stock)
     order = Order(
-        order_number=1000 + db_session.query(Order).count(),
+        order_number=generate_order_number(),
         user_id=user_id,
         status=status,
         stripe_payment_intent_id=f"pi_{uuid.uuid4().hex}",

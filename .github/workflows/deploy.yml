@@ -1,0 +1,225 @@
+# Builds the image and deploys it.
+#
+# `staging` deploys to staging. `main` **promotes the image staging already ran**
+# rather than rebuilding - see the promote step for why.
+#
+# Those two branch names are also written into the OIDC trust policy in
+# Biofarm_Infra's CicdStack, so no other branch - and no fork, and no pull
+# request - can assume the deploy role. There is no AWS access key anywhere:
+# GitHub mints a short-lived token per run and AWS validates it against that
+# trust policy.
+name: Deploy
+
+on:
+  push:
+    branches: [staging, main]
+
+concurrency:
+  # One deployment per environment at a time. Two overlapping runs would race to
+  # push the same tag and then both call StartDeployment, and App Runner would
+  # ship whichever image happened to land second.
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+env:
+  # From a repository variable, because the CDK app is deliberately
+  # region-agnostic - it deploys wherever the profile points. Hardcoding a region
+  # here means a stack deployed elsewhere fails with "no such service" when the
+  # service exists and is simply somewhere else.
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+  ECR_REPOSITORY: biofarm-backend
+
+jobs:
+  # Split from `deploy` so the tests still run on every push to a deploying
+  # branch even before there is an account to deploy to.
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: biofarm
+          POSTGRES_PASSWORD: biofarm
+          POSTGRES_DB: oasis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U biofarm -d oasis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the test suite
+        # Before anything is built or pushed. A red suite should never reach ECR,
+        # let alone App Runner.
+        run: python -m pytest app/tests/ -q
+
+      - name: Apply the migrations to an empty database, then check them
+        # Repeated from ci.yml rather than assumed. ci.yml runs on pull requests
+        # and exp; a change pushed straight to staging would otherwise reach App
+        # Runner having never had its migrations checked - and the lifespan hook
+        # no longer calls create_all, so a model change without a revision fails
+        # at runtime rather than at boot.
+        run: |
+          python -m alembic upgrade head
+          python -m alembic check
+        env:
+          DATABASE_URL: postgresql+psycopg://biofarm:biofarm@localhost:5432/oasis
+          APP_ENV: test
+          AUTH_BYPASS: "false"
+          STRIPE_BYPASS: "true"
+          COGNITO_REGION: us-east-2
+          COGNITO_USER_POOL_ID: us-east-2_ci
+          AWS_REGION: us-east-2
+          S3_BUCKET_NAME: ci-bucket
+          CLOUDFRONT_URL: https://ci.cloudfront.net
+          AWS_ACCESS_KEY_ID: ci
+          AWS_SECRET_ACCESS_KEY: ci
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+
+    # Skipped until the account exists and AWS_DEPLOY_ROLE_ARN is set as a
+    # repository variable.
+    #
+    # Without this the job fails on every push to a deploying branch from now
+    # until the infrastructure is stood up, for a reason that is not a problem
+    # with the change being pushed. A workflow that is always red teaches you to
+    # stop reading it, which costs more than the signal it was giving.
+    #
+    # `test` above still runs either way, so a push to staging is never
+    # unverified - it is only undeployed.
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the target environment
+        id: target
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build and push (staging)
+        if: steps.target.outputs.environment == 'staging'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+          # Tagged twice: :staging is what App Runner pulls, and the commit sha
+          # is what makes a rollback possible - the environment tag moves, so on
+          # its own it cannot say what is actually running.
+          docker build -t "$IMAGE:staging" -t "$IMAGE:${{ github.sha }}" .
+          docker push "$IMAGE:staging"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Promote the staging image (production)
+        if: steps.target.outputs.environment == 'prod'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        # Production runs the image staging ran, retagged - it does not rebuild.
+        #
+        # Rebuilding would produce a materially different artefact: the Dockerfile
+        # starts FROM python:3.13-slim, a floating tag, and apt-get installs
+        # unpinned packages, so "the same source" does not mean the same image.
+        # Promoting a digest is the whole reason both environments share one ECR
+        # repository, and rebuilding here would have quietly abandoned that.
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+
+          # Pulled by tag rather than resolved with `aws ecr describe-images`,
+          # which would need ecr:DescribeImages - a permission the deploy role
+          # does not have and should not need. A pull uses BatchGetImage and
+          # GetDownloadUrlForLayer, both already granted by grant_pull_push.
+          if ! docker pull "$IMAGE:staging"; then
+            echo "No :staging image to promote."
+            echo "Production deploys what staging has already run, so deploy to"
+            echo "staging and verify it there first."
+            exit 1
+          fi
+
+          # Retagging leaves the manifest untouched, so :prod ends up with the
+          # same digest as :staging - the same bytes, not a rebuild of the same
+          # source.
+          docker tag "$IMAGE:staging" "$IMAGE:prod"
+          docker push "$IMAGE:prod"
+
+          echo "Promoted:"
+          docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:staging"
+
+      - name: Deploy and wait for it to finish
+        env:
+          ENVIRONMENT: ${{ steps.target.outputs.environment }}
+        # Waiting matters. start-deployment returns as soon as the operation is
+        # queued, so without this the job goes green while the deployment is
+        # still running - and the container executes `alembic upgrade head` under
+        # `set -e` on start, so a bad migration aborts it and App Runner rolls
+        # back minutes after CI already reported success.
+        run: |
+          SERVICE="biofarm-$ENVIRONMENT-backend"
+          ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='$SERVICE'].ServiceArn" \
+            --output text)
+
+          if [ -z "$ARN" ]; then
+            echo "No App Runner service named $SERVICE in $AWS_REGION."
+            echo "Deploy Biofarm-App-$ENVIRONMENT first; the image is in ECR waiting for it."
+            exit 1
+          fi
+
+          aws apprunner start-deployment --service-arn "$ARN" >/dev/null
+          echo "Deployment started for $ENVIRONMENT; waiting."
+
+          # App Runner reports OPERATION_IN_PROGRESS while deploying, then
+          # settles on RUNNING or on a failure state.
+          for _ in $(seq 1 60); do
+            sleep 20
+            STATUS=$(aws apprunner describe-service --service-arn "$ARN" \
+              --query 'Service.Status' --output text)
+            echo "  status: $STATUS"
+            case "$STATUS" in
+              RUNNING)
+                echo "Deployed."
+                exit 0
+                ;;
+              OPERATION_IN_PROGRESS)
+                ;;
+              *)
+                echo "Deployment ended in $STATUS."
+                echo "The container runs 'alembic upgrade head' on start, so check"
+                echo "the App Runner application logs for a migration failure first."
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "Still not settled after 20 minutes; giving up rather than reporting success."
+          exit 1
