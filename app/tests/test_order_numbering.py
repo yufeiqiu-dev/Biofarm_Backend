@@ -5,12 +5,11 @@ information the business would not choose to: two orders a month apart give the
 exact number of orders taken in between. It was also a read-then-write race,
 since "max + 1" depends on what every other row holds.
 
-They are now a random string - see app/services/order_numbers.py. These tests
-cover the two things that matter about that: that the value is unguessable and
-unique, and that the shape survives being read down a phone line.
+They are now ten random digits - see app/services/order_numbers.py. These tests
+cover the two things that matter: that the value is unguessable, and that its
+shape survives a spreadsheet and a phone call.
 """
 
-import re
 import uuid
 from decimal import Decimal
 from unittest.mock import patch
@@ -21,9 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.order import Order, OrderStatus
 from app.schemas.order import CartItemIn, ShippingIn
 from app.services.order_numbers import (
-    ALPHABET,
     LENGTH,
-    PREFIX,
     generate_order_number,
     looks_like_an_order_number,
 )
@@ -54,34 +51,38 @@ def _create(db_session, variant, quantity: int = 1) -> Order:
 
 def test_the_shape_is_stable():
     number = generate_order_number()
-    assert number.startswith(PREFIX)
-    assert len(number) == len(PREFIX) + LENGTH
+    assert len(number) == LENGTH
     assert looks_like_an_order_number(number)
 
 
-def test_the_alphabet_avoids_characters_people_confuse():
-    """These get read down a phone line and typed into support emails. I, L, O
-    and U are the ones mistaken for 1, 1, 0 and V, and a customer reading a
-    number aloud has no way to disambiguate them."""
-    for character in "ILOU":
-        assert character not in ALPHABET, character
-
-    for _ in range(200):
-        body = generate_order_number()[len(PREFIX):]
-        assert all(c in ALPHABET for c in body), body
+def test_it_is_only_digits():
+    """The whole point of this format. Everything downstream of an order number
+    tends to want digits: accounting software, spreadsheets, a numeric keypad."""
+    for _ in range(500):
+        assert generate_order_number().isdigit()
 
 
-def test_it_is_uppercase_so_case_never_has_to_be_communicated():
-    for _ in range(50):
-        number = generate_order_number()
-        assert number == number.upper()
+def test_it_never_starts_with_zero():
+    """A leading zero survives the database and the API perfectly well and then
+    vanishes the moment someone pastes the number into a spreadsheet - which is
+    where order numbers spend a lot of their life."""
+    for _ in range(500):
+        assert not generate_order_number().startswith("0")
 
 
-def test_numbers_do_not_repeat():
-    """32^8 is a little over a trillion, so a collision in this sample would mean
-    the generator is not actually random."""
-    numbers = {generate_order_number() for _ in range(5000)}
-    assert len(numbers) == 5000
+def test_a_small_sample_does_not_repeat():
+    """Deliberately 200 and not more.
+
+    With 9e9 possibilities the birthday bound makes a large sample genuinely
+    likely to collide - 5,000 draws collide about 0.14% of the time, which is a
+    test that fails once every few hundred CI runs for no reason. At 200 the
+    chance is around one in half a million, so a failure here means the
+    generator stopped being random rather than that the dice were unlucky.
+
+    Collision *handling* is covered by test_a_collision_is_retried_rather_than_raised.
+    """
+    numbers = {generate_order_number() for _ in range(200)}
+    assert len(numbers) == 200
 
 
 def test_it_uses_a_cryptographic_source():
@@ -102,13 +103,13 @@ def test_it_uses_a_cryptographic_source():
     "value",
     [
         "",
-        "1000",
-        "OB-",
-        "OB-SHORT",
-        "OB-TOOLONGVALUE",
-        "XX-7K3M9QXZ",
-        "OB-7K3M9QXI",  # I is not in the alphabet
-        "ob-7k3m9qxz",  # lowercase
+        "1000",  # the old sequential format
+        "482719305",  # one short
+        "48271930567",  # one long
+        "0827193056",  # leading zero
+        "48271930a6",
+        "OB-7K3M9QXZ",  # the previous format
+        "٤٨٢٧١٩٣٠٥٦",  # Arabic-Indic digits: isdigit() alone accepts these
     ],
 )
 def test_malformed_values_are_recognised_as_such(value):
@@ -131,8 +132,10 @@ def test_consecutive_orders_are_not_consecutive_numbers(db_session):
     numbers = [_create(db_session, variant).order_number for _ in range(3)]
 
     assert len(set(numbers)) == 3
-    bodies = [n[len(PREFIX):] for n in numbers]
-    assert not all(re.fullmatch(r"\d+", b) for b in bodies), bodies
+    # The old scheme produced 1000, 1001, 1002. Consecutive values would mean it
+    # is back, whatever the format looks like.
+    as_ints = sorted(int(n) for n in numbers)
+    assert as_ints[1] - as_ints[0] != 1 or as_ints[2] - as_ints[1] != 1, numbers
 
 
 def test_a_collision_is_retried_rather_than_raised(db_session):

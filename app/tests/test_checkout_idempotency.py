@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from app.schemas.order import CartItemIn, ShippingIn
 from app.services.stripe_service import TaxResult
 from app.tests.test_orders import make_product_with_variant
 
@@ -112,3 +113,83 @@ def test_the_key_does_not_leak_the_customer_identity(user_client: TestClient, db
     _, spy = _post(user_client, variant.id)
 
     assert "test-user-123" not in _key_of(spy)
+
+
+# --- the other half of the idempotency key ---
+#
+# The key stops Stripe opening a second PaymentIntent for a resubmitted
+# checkout - which means the *same* payment intent id then arrives at
+# save_checkout_session, where stripe_pi_id is unique. Inserting blindly turned
+# the retry the key had just made safe into a 500. Found by resubmitting an
+# identical checkout against the real Stripe API, not by a unit test.
+
+def test_resubmitting_a_checkout_does_not_500(user_client: TestClient, db_session):
+    _, variant = make_product_with_variant(db_session, "IDEM-07", stock=10)
+
+    pi = MagicMock()
+    pi.id = "pi_resubmitted_same_intent"
+    pi.client_secret = "cs_test"
+
+    def submit():
+        with patch("app.api.v1.endpoints.orders.create_payment_intent", MagicMock(return_value=pi)):
+            with patch(
+                "app.api.v1.endpoints.orders.calculate_tax",
+                MagicMock(return_value=TaxResult(tax_amount_cents=88, total_cents=1088)),
+            ):
+                return user_client.post(
+                    "/api/v1/orders/payment-intent",
+                    json={
+                        "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+                        "shipping": SHIPPING,
+                    },
+                )
+
+    assert submit().status_code == 201
+    assert submit().status_code == 201
+
+
+def test_a_resubmitted_checkout_leaves_exactly_one_session(user_client: TestClient, db_session):
+    """Two sessions for one payment intent would mean the webhook converts one
+    and leaves the other to be swept eight days later."""
+    from app.models.checkout_session import CheckoutSession
+
+    _, variant = make_product_with_variant(db_session, "IDEM-08", stock=10)
+    pi = MagicMock()
+    pi.id = "pi_only_one_session"
+    pi.client_secret = "cs_test"
+
+    for _ in range(3):
+        with patch("app.api.v1.endpoints.orders.create_payment_intent", MagicMock(return_value=pi)):
+            with patch(
+                "app.api.v1.endpoints.orders.calculate_tax",
+                MagicMock(return_value=TaxResult(tax_amount_cents=88, total_cents=1088)),
+            ):
+                user_client.post(
+                    "/api/v1/orders/payment-intent",
+                    json={
+                        "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+                        "shipping": SHIPPING,
+                    },
+                )
+
+    sessions = db_session.query(CheckoutSession).filter_by(stripe_pi_id="pi_only_one_session").all()
+    assert len(sessions) == 1
+
+
+def test_a_resubmitted_checkout_stores_the_latest_details(db_session):
+    """The webhook builds the order from whatever is stored here, so a corrected
+    address on the second attempt has to be the one that survives."""
+    from app.services.order_service import save_checkout_session
+
+    _, variant = make_product_with_variant(db_session, "IDEM-09", stock=10)
+    cart = [CartItemIn(variant_id=variant.id, quantity=1)]
+
+    first = ShippingIn(**{**SHIPPING, "address1": "1 Wrong St"})
+    corrected = ShippingIn(**{**SHIPPING, "address1": "2 Right Ave"})
+
+    save_checkout_session(db_session, "pi_same", "u", cart, first, 88, "a@example.com")
+    session = save_checkout_session(db_session, "pi_same", "u", cart, corrected, 99, "b@example.com")
+
+    assert "2 Right Ave" in session.shipping_json
+    assert session.tax_amount_cents == 99
+    assert session.customer_email == "b@example.com"

@@ -134,15 +134,40 @@ def save_checkout_session(
     tax_amount_cents: int = 0,
     customer_email: str = "",
 ) -> CheckoutSession:
-    session = CheckoutSession(
-        stripe_pi_id=stripe_pi_id,
-        user_id=user_id,
-        customer_email=customer_email,
-        cart_json=json.dumps([{"variant_id": str(item.variant_id), "quantity": item.quantity} for item in cart]),
-        shipping_json=shipping.model_dump_json(),
-        tax_amount_cents=tax_amount_cents,
+    """Record the cart against a PaymentIntent, replacing any existing record.
+
+    Idempotent on purpose, and it has to be. Checkout sends Stripe an idempotency
+    key derived from the buyer and the cart, so a resubmitted checkout - a
+    double-clicked Pay button, a lost response, a browser retry - gets *the same*
+    PaymentIntent back. That is the point of the key: it stops a second
+    authorization hold on the customer's card.
+
+    But the same id then arrives here, where stripe_pi_id is unique. Inserting
+    blindly raised an IntegrityError and returned a 500, so the very retry the
+    idempotency key made safe at Stripe was fatal one layer down. The two halves
+    have to agree.
+
+    Updating rather than skipping matters too: the shipping address or the tax
+    may legitimately have changed between attempts, and the webhook builds the
+    order from whatever is stored here.
+    """
+    cart_json = json.dumps(
+        [{"variant_id": str(item.variant_id), "quantity": item.quantity} for item in cart]
     )
-    db.add(session)
+
+    session = db.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == stripe_pi_id)
+    )
+    if session is None:
+        session = CheckoutSession(stripe_pi_id=stripe_pi_id)
+        db.add(session)
+
+    session.user_id = user_id
+    session.customer_email = customer_email
+    session.cart_json = cart_json
+    session.shipping_json = shipping.model_dump_json()
+    session.tax_amount_cents = tax_amount_cents
+
     db.commit()
     db.refresh(session)
     return session
