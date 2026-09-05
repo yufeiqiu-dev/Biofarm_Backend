@@ -260,3 +260,34 @@ def test_delete_product_not_found(admin_client: TestClient):
 def test_delete_product_invalid_uuid(admin_client: TestClient):
     response = admin_client.delete("/api/v1/admin/products/not-a-uuid")
     assert response.status_code == 422
+
+
+# --- tag names ---
+
+def test_a_whitespace_only_tag_name_is_rejected(admin_client):
+    """min_length=1 was declared before the strip, so "   " passed validation
+    and the service's own .strip() then wrote an empty name - a tag nothing can
+    match and nothing can usefully display."""
+    response = admin_client.post("/api/v1/admin/tags", json={"name": "   "})
+
+    assert response.status_code == 422
+
+
+def test_a_tag_name_is_stored_trimmed(admin_client, db_session):
+    from app.models.tag import Tag
+
+    response = admin_client.post("/api/v1/admin/tags", json={"name": "  Organic  "})
+
+    assert response.status_code == 201
+    assert response.json()["name"] == "Organic"
+    assert db_session.query(Tag).filter_by(name="Organic").one()
+
+
+def test_trailing_whitespace_does_not_create_a_second_tag(admin_client):
+    """Without the strip these were two different names and both inserted, so
+    the tag list showed "Organic" twice."""
+    assert admin_client.post("/api/v1/admin/tags", json={"name": "Herbal"}).status_code == 201
+
+    response = admin_client.post("/api/v1/admin/tags", json={"name": "Herbal "})
+
+    assert response.status_code == 409

@@ -1,0 +1,29 @@
+# Secrets must never enter a layer - an image layer is not a secret store, and
+# anyone who can pull the image can read it.
+.env
+.env.*
+!.env.example
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# History and editor state
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+
+# Tests do not run in the image; excluding them keeps it smaller and gives an
+# attacker less to work with.
+app/tests/
+
+# Docs
+readme.md
+*.md

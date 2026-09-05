@@ -23,19 +23,35 @@ def _get_stripe():
     return stripe
 
 
-def create_payment_intent(amount_cents: int, order_id: str | None = None) -> MockPaymentIntent | stripe.PaymentIntent:
+def create_payment_intent(
+    amount_cents: int,
+    order_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> MockPaymentIntent | stripe.PaymentIntent:
+    """Authorize (do not capture) amount_cents.
+
+    capture_method="manual" is deliberate: checkout only places a hold, and the
+    money moves at ship time. See order_service for the rest of that lifecycle.
+
+    Pass an idempotency_key for anything a client can retry. Without one, a
+    double-clicked Pay button or a network-level retry creates a second
+    PaymentIntent and a second authorization hold on the customer's card - two
+    holds against one basket, and only one of them ever gets voided.
+    """
     settings = get_settings()
     if settings.stripe_bypass:
         bypass_id = f"pi_bypass_{uuid.uuid4().hex[:16]}"
         return MockPaymentIntent(id=bypass_id, client_secret=f"{bypass_id}_secret_bypass")
     s = _get_stripe()
     metadata = {"order_id": order_id} if order_id else {}
+    kwargs = {"idempotency_key": idempotency_key} if idempotency_key else {}
     return s.PaymentIntent.create(
         amount=amount_cents,
         currency="usd",
         capture_method="manual",
         metadata=metadata,
         automatic_payment_methods={"enabled": True},
+        **kwargs,
     )
 
 
@@ -81,6 +97,32 @@ def create_refund(payment_intent_id: str) -> dict | stripe.Refund:
         return {"id": f"re_bypass_{uuid.uuid4().hex[:16]}", "status": "succeeded"}
     s = _get_stripe()
     return s.Refund.create(payment_intent=payment_intent_id)
+
+
+def get_card_details(payment_method_id: str) -> tuple[str, str]:
+    """Return (brand, last4) for a payment method, or ("", "") if unavailable.
+
+    Lives here rather than in the webhook endpoint so it honours stripe_bypass
+    like every other Stripe call, and so the tests keep a single seam to patch.
+    Card details are cosmetic - they appear on the order summary - so every
+    failure degrades to empty strings rather than blocking order creation.
+    """
+    if not payment_method_id or not isinstance(payment_method_id, str):
+        return "", ""
+
+    settings = get_settings()
+    if settings.stripe_bypass:
+        return "visa", "4242"
+
+    try:
+        pm = _get_stripe().PaymentMethod.retrieve(payment_method_id)
+    except Exception:
+        return "", ""
+
+    card = getattr(pm, "card", None)
+    if not card:
+        return "", ""
+    return getattr(card, "brand", "") or "", getattr(card, "last4", "") or ""
 
 
 def verify_webhook_signature(payload: bytes, sig_header: str) -> stripe.Event:

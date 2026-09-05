@@ -109,13 +109,41 @@ def test_webhook_pi_cancelled_deletes_session(client, db_session):
     assert order is None
 
 
-def test_webhook_payment_succeeded_no_session_is_noop(client, db_session):
-    """Duplicate or late payment_intent.succeeded with no session is a safe no-op."""
+def test_webhook_payment_succeeded_after_order_exists_is_noop(client, db_session):
+    """A duplicate or late event whose order already exists is a safe no-op.
+
+    Both amount_capturable_updated and succeeded reach the same handler, and the
+    first consumes the checkout session, so the second legitimately finds none.
+    That is the normal path, not a failure.
+    """
+    variant = make_product_and_variant(db_session)
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    first = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
+    assert first.status_code == 200
+
+    # Session is gone now; the order it became stands in for it.
+    second = post_webhook(client, pi_id, "payment_intent.succeeded")
+
+    assert second.status_code == 200
+    assert db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).count() == 1
+
+
+def test_webhook_payment_succeeded_with_no_session_and_no_order_fails(client, db_session):
+    """A paid intent with nothing behind it must not be reported as handled.
+
+    No checkout session and no order means the customer was charged and there is
+    nothing to fulfil. Answering 200 would tell Stripe the event was processed
+    and burn the retry that is the only free recovery mechanism available, so
+    this has to fail loudly instead.
+    """
     pi_id = f"pi_{uuid.uuid4().hex}"
 
     response = post_webhook(client, pi_id, "payment_intent.succeeded")
 
-    assert response.status_code == 200
+    assert response.status_code == 500
+    assert db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).count() == 0
 
 
 def test_webhook_payment_failed_is_noop(client, db_session):
@@ -166,3 +194,108 @@ def test_webhook_invalid_signature_returns_400(client):
             headers={"stripe-signature": "bad"},
         )
     assert response.status_code == 400
+
+
+# --- malformed payloads must not enter the retry schedule ---
+
+def test_webhook_unparseable_payload_returns_400_not_500(client: TestClient):
+    """construct_event raises ValueError for a body that is not valid JSON.
+
+    Letting it escape produced a 500 - and a 500 is exactly what tells Stripe to
+    retry, so a payload that can never parse was replayed for the full retry
+    schedule, filling the logs and the Stripe dashboard with a failure no retry
+    could fix. 400 tells Stripe not to bother.
+    """
+    with patch(
+        "app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+        side_effect=ValueError("Invalid payload"),
+    ):
+        response = client.post(
+            "/api/v1/stripe/webhook",
+            content=b"{not json",
+            headers={"stripe-signature": "t=1,v1=fake"},
+        )
+
+    assert response.status_code == 400
+    assert "Malformed" in response.json()["detail"]
+
+
+def test_webhook_signature_failure_is_still_distinguished_from_a_bad_body(client: TestClient):
+    """Both answer 400, but for different reasons, and the detail says which."""
+    import stripe
+
+    with patch(
+        "app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+        side_effect=stripe.error.SignatureVerificationError("bad sig", "sig-header"),
+    ):
+        response = client.post(
+            "/api/v1/stripe/webhook",
+            content=b"{}",
+            headers={"stripe-signature": "t=1,v1=wrong"},
+        )
+
+    assert response.status_code == 400
+    assert "signature" in response.json()["detail"].lower()
+
+
+# --- card details go through stripe_service, not the SDK ---
+
+def test_card_details_come_from_the_service_layer(client: TestClient, db_session):
+    """The endpoint used to call stripe.PaymentMethod.retrieve directly, which
+    sidesteps stripe_bypass and removes the seam every other Stripe call is
+    tested through. Patching the service must be enough to control it."""
+    variant = make_product_and_variant(db_session)
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    event = make_stripe_event("payment_intent.succeeded", pi_id)
+    event.data.object.payment_method = "pm_test_123"
+
+    with patch(
+        "app.api.v1.endpoints.stripe_webhook.get_card_details",
+        return_value=("amex", "0005"),
+    ):
+        with patch(
+            "app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+            return_value=event,
+        ):
+            response = client.post(
+                "/api/v1/stripe/webhook",
+                content=b"fake-payload",
+                headers={"stripe-signature": "t=1,v1=fake"},
+            )
+
+    assert response.status_code == 200
+    order = db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).one()
+    assert order.card_brand == "amex"
+    assert order.card_last4 == "0005"
+
+
+def test_a_card_lookup_failure_does_not_block_the_order(client: TestClient, db_session):
+    """Card brand and last4 are cosmetic. Losing them must not cost the customer
+    an order they have already paid for."""
+    variant = make_product_and_variant(db_session)
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    event = make_stripe_event("payment_intent.succeeded", pi_id)
+    event.data.object.payment_method = "pm_test_456"
+
+    with patch(
+        "app.services.stripe_service._get_stripe",
+        side_effect=RuntimeError("Stripe is down"),
+    ):
+        with patch(
+            "app.api.v1.endpoints.stripe_webhook.verify_webhook_signature",
+            return_value=event,
+        ):
+            response = client.post(
+                "/api/v1/stripe/webhook",
+                content=b"fake-payload",
+                headers={"stripe-signature": "t=1,v1=fake"},
+            )
+
+    assert response.status_code == 200
+    order = db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).one()
+    assert order.status == OrderStatus.awaiting_fulfillment
+    assert order.card_brand == ""

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 TEST_REGION = "us-east-2"
 TEST_POOL_ID = "us-east-2_TESTPOOL"
+TEST_CLIENT_ID = "test-app-client-id"
 TEST_ISS = f"https://cognito-idp.{TEST_REGION}.amazonaws.com/{TEST_POOL_ID}"
 
 # RSA key pair for signing test tokens — generated once per module
@@ -26,6 +27,7 @@ def _make_token(**overrides) -> str:
         "sub": "user-123",
         "iss": TEST_ISS,
         "token_use": "access",
+        "client_id": TEST_CLIENT_ID,
         "cognito:groups": ["Admin"],
         "iat": now,
         "exp": now + 3600,
@@ -42,20 +44,32 @@ def _jwks_mock():
     return mock
 
 
-def _settings_mock(auth_bypass: bool = False) -> MagicMock:
+def _settings_mock(auth_bypass: bool = False, client_id: str = TEST_CLIENT_ID) -> MagicMock:
     s = MagicMock()
     s.auth_bypass = auth_bypass
     s.cognito_region = TEST_REGION
     s.cognito_user_pool_id = TEST_POOL_ID
+    # Set explicitly: a bare MagicMock attribute is truthy and would compare
+    # unequal to every real client_id, failing every token in the suite.
+    s.cognito_user_pool_client_id = client_id
     return s
 
 
-def _call(client: TestClient, token: str | None, auth_bypass: bool = False, jwks_mock=None):
+def _call(
+    client: TestClient,
+    token: str | None,
+    auth_bypass: bool = False,
+    jwks_mock=None,
+    client_id: str = TEST_CLIENT_ID,
+    endpoint: str = _ENDPOINT,
+    method: str = "delete",
+):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     jwks = jwks_mock or _jwks_mock()
-    with patch("app.dependencies.auth.get_settings", return_value=_settings_mock(auth_bypass)):
+    settings = _settings_mock(auth_bypass, client_id)
+    with patch("app.dependencies.auth.get_settings", return_value=settings):
         with patch("app.dependencies.auth._jwks_client", return_value=jwks):
-            return client.delete(_ENDPOINT, headers=headers)
+            return getattr(client, method)(endpoint, headers=headers)
 
 
 # --- auth_bypass=False ---
@@ -162,6 +176,80 @@ def test_bypass_non_admin_token_still_rejected(client: TestClient):
     assert response.status_code == 403
 
 
-def test_require_user_blocks_unauthenticated(client):
-    from app.dependencies.auth import require_user
-    assert callable(require_user)
+# --- app client binding (client_id) ---
+
+def test_token_from_another_app_client_returns_401(client: TestClient):
+    """A token minted by a different app client in the same user pool has a
+    valid signature and the right issuer, and must still be rejected."""
+    token = _make_token(client_id="some-other-app-client")
+    response = _call(client, token=token)
+    assert response.status_code == 401
+    assert "not issued for this application" in response.json()["detail"]
+
+
+def test_token_with_no_client_id_claim_returns_401(client: TestClient):
+    token = _make_token()
+    payload = jwt.decode(token, options={"verify_signature": False})
+    del payload["client_id"]
+    token = jwt.encode(payload, _private_key, algorithm="RS256")
+    response = _call(client, token=token)
+    assert response.status_code == 401
+
+
+def test_client_id_check_skipped_when_unconfigured(client: TestClient):
+    """An existing .env without COGNITO_USER_POOL_CLIENT_ID must keep working;
+    the production guard is what makes it mandatory outside development."""
+    token = _make_token(client_id="anything-at-all")
+    response = _call(client, token=token, client_id="")
+    assert response.status_code == 404
+
+
+def test_bypass_wrong_client_id_still_rejected(client: TestClient):
+    token = _make_token(client_id="some-other-app-client")
+    response = _call(client, token=token, auth_bypass=True)
+    assert response.status_code == 401
+
+
+# --- require_user shares the same verification ---
+
+_USER_ENDPOINT = "/api/v1/orders"
+
+
+def test_require_user_rejects_token_from_another_app_client(client: TestClient):
+    """require_user and require_admin used to carry separate copies of these
+    checks. This asserts they now share one, so a check added to the admin path
+    cannot go missing from the customer path."""
+    token = _make_token(client_id="some-other-app-client")
+    response = _call(client, token=token, endpoint=_USER_ENDPOINT, method="get")
+    assert response.status_code == 401
+
+
+def test_require_user_rejects_id_token(client: TestClient):
+    token = _make_token(token_use="id")
+    response = _call(client, token=token, endpoint=_USER_ENDPOINT, method="get")
+    assert response.status_code == 401
+
+
+def test_require_user_rejects_wrong_issuer(client: TestClient):
+    token = _make_token(iss="https://cognito-idp.us-west-2.amazonaws.com/wrong_pool")
+    response = _call(client, token=token, endpoint=_USER_ENDPOINT, method="get")
+    assert response.status_code == 401
+
+
+def test_require_user_accepts_a_non_admin_token(client: TestClient):
+    """No group membership required - the admin path's 403 must not leak here."""
+    token = _make_token(**{"cognito:groups": []})
+    response = _call(client, token=token, endpoint=_USER_ENDPOINT, method="get")
+    assert response.status_code == 200
+
+
+def test_require_user_missing_token_returns_401(client: TestClient):
+    response = _call(client, token=None, endpoint=_USER_ENDPOINT, method="get")
+    assert response.status_code == 401
+
+
+def test_null_groups_claim_returns_403_not_500(client: TestClient):
+    """A null cognito:groups claim used to reach `"Admin" in None`."""
+    token = _make_token(**{"cognito:groups": None})
+    response = _call(client, token=token)
+    assert response.status_code == 403

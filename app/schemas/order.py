@@ -6,6 +6,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.order import OrderStatus
+from app.schemas.numeric import Money
 
 
 # --- Request schemas ---
@@ -49,7 +50,7 @@ class OrderItemOut(BaseModel):
     variant_id: Optional[uuid.UUID]
     product_name: str
     variant_label: str
-    unit_price: Decimal
+    unit_price: Money
     quantity: int
 
 
@@ -63,8 +64,8 @@ class OrderOut(BaseModel):
     id: uuid.UUID
     order_number: int
     status: OrderStatus
-    total_amount: Decimal
-    tax_amount: Decimal = Decimal("0")
+    total_amount: Money
+    tax_amount: Money = Decimal("0")
     card_brand: str = ""
     card_last4: str = ""
     shipping_name: str

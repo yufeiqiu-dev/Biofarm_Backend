@@ -4,12 +4,19 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.checkout_session import CheckoutSession
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
 from app.schemas.order import CartItemIn, ShippingIn
+
+
+# How many times to re-derive an order number when another transaction takes the
+# one we picked. Each retry re-reads the maximum, so the only way to exhaust this
+# is that many orders committing inside one request - far beyond this catalog.
+_ORDER_NUMBER_ATTEMPTS = 5
 
 
 def _next_order_number(db: Session) -> int:
@@ -54,48 +61,75 @@ def create_order(
         ).all()
     }
 
-    items = []
+    # Plain values rather than ORM objects: a retry below needs to build fresh
+    # OrderItems, and an instance from a rolled-back attempt cannot be reused.
+    item_values: list[dict] = []
     total = Decimal("0")
     for cart_item in cart:
         variant = variants.get(cart_item.variant_id)
         if variant is None:
             raise ValueError(f"Variant {cart_item.variant_id} not found")
-        line = variant.price * cart_item.quantity
-        total += line
-        items.append(
-            OrderItem(
-                variant_id=variant.id,
-                product_name=variant.product.name if variant.product else "Unknown",
-                variant_label=f"{variant.size_value} {variant.size_unit}",
-                unit_price=variant.price,
-                quantity=cart_item.quantity,
-            )
+        total += variant.price * cart_item.quantity
+        item_values.append(
+            {
+                "variant_id": variant.id,
+                "product_name": variant.product.name if variant.product else "Unknown",
+                "variant_label": f"{variant.size_value} {variant.size_unit}",
+                "unit_price": variant.price,
+                "quantity": cart_item.quantity,
+            }
         )
 
-    order = Order(
-        order_number=_next_order_number(db),
-        user_id=user_id,
-        customer_email=customer_email,
-        card_brand=card_brand,
-        card_last4=card_last4,
-        status=OrderStatus.pending,
-        stripe_payment_intent_id=stripe_pi_id,
-        shipping_name=shipping.name,
-        shipping_phone=shipping.phone,
-        shipping_address1=shipping.address1,
-        shipping_address2=shipping.address2,
-        shipping_city=shipping.city,
-        shipping_state=shipping.state,
-        shipping_zip=shipping.zip,
-        notes=shipping.notes,
-        total_amount=total,
-        tax_amount=tax_amount,
-        items=items,
-    )
-    db.add(order)
-    db.commit()
-    db.refresh(order)
-    return order
+    def build(order_number: int) -> Order:
+        return Order(
+            order_number=order_number,
+            user_id=user_id,
+            customer_email=customer_email,
+            card_brand=card_brand,
+            card_last4=card_last4,
+            status=OrderStatus.pending,
+            stripe_payment_intent_id=stripe_pi_id,
+            shipping_name=shipping.name,
+            shipping_phone=shipping.phone,
+            shipping_address1=shipping.address1,
+            shipping_address2=shipping.address2,
+            shipping_city=shipping.city,
+            shipping_state=shipping.state,
+            shipping_zip=shipping.zip,
+            notes=shipping.notes,
+            total_amount=total,
+            tax_amount=tax_amount,
+            items=[OrderItem(**values) for values in item_values],
+        )
+
+    # order_number is "max + 1" over a unique column, which is a race: two
+    # checkouts landing together read the same maximum and the second insert
+    # violates the constraint. Unhandled that is a 500 on a request whose card is
+    # already authorized - the customer is charged and has no order.
+    #
+    # Retrying re-reads the maximum, so the loser of the race simply takes the
+    # next number. Chosen over a database sequence because it needs no migration
+    # and behaves the same on the SQLite engine the tests run against.
+    for attempt in range(_ORDER_NUMBER_ATTEMPTS):
+        order = build(_next_order_number(db))
+        db.add(order)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            # orders has a second unique column, stripe_payment_intent_id, and
+            # retrying a conflict on that one would just fail five times and
+            # hide the real cause. If an order for this intent now exists, the
+            # collision was not the number.
+            if _load_order_by_pi(db, stripe_pi_id) is not None:
+                raise
+            if attempt == _ORDER_NUMBER_ATTEMPTS - 1:
+                raise
+            continue
+        db.refresh(order)
+        return order
+
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def save_checkout_session(
@@ -155,8 +189,14 @@ def delete_checkout_session(db: Session, stripe_pi_id: str) -> None:
 
 
 def cleanup_stale_checkout_sessions(db: Session, max_age_days: int = 8) -> int:
-    """Delete sessions older than max_age_days. Called at startup to catch any
-    that never received a payment_intent.canceled webhook (e.g. backend was down)."""
+    """Delete sessions older than max_age_days.
+
+    A session that never received either a payment or a payment_intent.canceled
+    webhook - the backend was down, or the customer simply closed the tab - is
+    otherwise there forever. Run from app.jobs.cleanup on a schedule; this used
+    to run in the startup hook, which meant a table scan and delete at the exact
+    moment the service was trying to become healthy.
+    """
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
     stale = db.scalars(
         select(CheckoutSession).where(CheckoutSession.created_at < cutoff)

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import uuid
 from decimal import Decimal
 
@@ -40,6 +42,31 @@ def _get_customer_email(current_user: dict, id_token: str = "") -> str:
         return payload.get("email", "")
     except Exception:
         return ""
+
+
+def _idempotency_key(user_sub: str, payload: CreatePaymentIntentRequest, total_cents: int) -> str:
+    """A key that is stable for one checkout attempt and different for the next.
+
+    Stripe deduplicates creates that carry the same key, which is what stops a
+    double-clicked Pay button or a network-level retry from opening a second
+    PaymentIntent - a second authorization hold on the customer's card, against
+    the same basket, that nothing will ever void.
+
+    Derived from the buyer, the cart, the destination and the amount, so
+    genuinely re-submitting a changed basket gets its own intent while a repeat
+    of the identical request does not. Stripe expires these after 24 hours,
+    which comfortably outlives a checkout.
+    """
+    material = json.dumps(
+        {
+            "sub": user_sub,
+            "cart": sorted((str(i.variant_id), i.quantity) for i in payload.cart),
+            "shipping": payload.shipping.model_dump(mode="json"),
+            "total_cents": total_cents,
+        },
+        sort_keys=True,
+    )
+    return f"checkout_{hashlib.sha256(material.encode()).hexdigest()[:48]}"
 
 
 @router.post(
@@ -97,7 +124,11 @@ def initiate_checkout(
                 detail=f"Tax calculation failed: {e}. Ensure your Stripe Tax origin address is configured in the Stripe Dashboard.",
             )
 
-        pi = create_payment_intent(tax_result.total_cents, order_id=None)
+        pi = create_payment_intent(
+            tax_result.total_cents,
+            order_id=None,
+            idempotency_key=_idempotency_key(current_user["sub"], payload, tax_result.total_cents),
+        )
         id_token = request.headers.get("X-Id-Token", "")
         customer_email = _get_customer_email(current_user, id_token)
 

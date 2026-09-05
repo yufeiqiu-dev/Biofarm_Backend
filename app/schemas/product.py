@@ -3,14 +3,15 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.numeric import Measure, Money
 from app.schemas.tag import TagOut
 
 
 class ProductVariantBase(BaseModel):
     catalog_id: str = Field(..., min_length=1, max_length=100)
-    size_value: float = Field(..., gt=0)
+    size_value: Measure
     size_unit: str = Field(..., min_length=1, max_length=50)
-    price: float = Field(..., ge=0)
+    price: Money
     stock: int = Field(..., ge=0)
 
 
