@@ -1,0 +1,79 @@
+# Runs on every pull request and on the working branch.
+#
+# The suite needs no .env, no AWS credentials and no Stripe account: conftest.py
+# pins the whole configuration through os.environ above the app imports, and S3
+# and Stripe are patched per test. That is what makes this job the same on a
+# developer's machine and here.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [exp]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # A real Postgres, pinned to the version RDS runs and docker-compose runs
+      # locally. It exists for the migration step below - SQLite cannot stand in,
+      # because the failure that made this necessary was a foreign key to a table
+      # no migration created, which SQLite does not enforce.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: biofarm
+          POSTGRES_PASSWORD: biofarm
+          POSTGRES_DB: oasis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U biofarm -d oasis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the runtime image in Dockerfile. A version difference between
+          # CI and the container is the kind of thing that only shows up once.
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the test suite
+        run: python -m pytest app/tests/ -q
+
+      - name: Apply the migrations to an empty database, then check them
+        # The suite builds its schema with create_all against SQLite and never
+        # runs a migration, so it cannot catch a broken chain - which is exactly
+        # how the original one stayed broken. `upgrade head` proves it applies to
+        # nothing at all, the way RDS will see it; `check` then proves the models
+        # and the migration still describe the same database, catching a model
+        # change committed without a revision.
+        run: |
+          python -m alembic upgrade head
+          python -m alembic check
+        env:
+          DATABASE_URL: postgresql+psycopg://biofarm:biofarm@localhost:5432/oasis
+          APP_ENV: test
+          AUTH_BYPASS: "false"
+          STRIPE_BYPASS: "true"
+          COGNITO_REGION: us-east-2
+          COGNITO_USER_POOL_ID: us-east-2_ci
+          AWS_REGION: us-east-2
+          S3_BUCKET_NAME: ci-bucket
+          CLOUDFRONT_URL: https://ci.cloudfront.net
+          AWS_ACCESS_KEY_ID: ci
+          AWS_SECRET_ACCESS_KEY: ci
+
+      - name: Build the container image
+        # Not pushed. This is here because a Dockerfile that stops building is
+        # invisible to the test suite and only surfaces at deploy time.
+        run: docker build -t biofarm-backend:ci .

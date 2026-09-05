@@ -1,0 +1,98 @@
+# Builds the image and deploys it.
+#
+# `staging` deploys to staging, `main` to production. Those two branch names are
+# also written into the OIDC trust policy in Biofarm_Infra's CicdStack, so no
+# other branch - and no fork, and no pull request - can assume the deploy role.
+#
+# There is no AWS access key anywhere. GitHub mints a short-lived token per run
+# and AWS validates it against that trust policy, so there is no standing
+# credential to leak.
+name: Deploy
+
+on:
+  push:
+    branches: [staging, main]
+
+concurrency:
+  # One deployment per environment at a time. Two overlapping runs would race to
+  # push the same tag and then both call StartDeployment, and App Runner would
+  # ship whichever image happened to land second.
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: biofarm-backend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the test suite
+        # Deliberately before anything is built or pushed. A red suite should
+        # never reach ECR, let alone App Runner.
+        run: python -m pytest app/tests/ -q
+
+      - name: Resolve the target environment
+        id: target
+        # main -> prod, staging -> staging. The tag is what App Runner points at.
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ENVIRONMENT: ${{ steps.target.outputs.environment }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+          # Tagged twice: the environment tag is what App Runner pulls, and the
+          # commit sha is what makes a rollback possible - the environment tag
+          # moves, so on its own it cannot tell you what is actually running.
+          docker build -t "$IMAGE:$ENVIRONMENT" -t "$IMAGE:${{ github.sha }}" .
+          docker push "$IMAGE:$ENVIRONMENT"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Start the deployment
+        env:
+          ENVIRONMENT: ${{ steps.target.outputs.environment }}
+        # Explicit rather than triggered by the ECR push. Both environments share
+        # one repository, so an ECR trigger would deploy whatever landed under a
+        # tag - including a push meant for the other environment.
+        run: |
+          ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='biofarm-$ENVIRONMENT-backend'].ServiceArn" \
+            --output text)
+          if [ -z "$ARN" ]; then
+            echo "No App Runner service for $ENVIRONMENT."
+            echo "Deploy Biofarm-App-$ENVIRONMENT first; the image is now in ECR waiting for it."
+            exit 1
+          fi
+          aws apprunner start-deployment --service-arn "$ARN"
+          echo "Deployment started for $ENVIRONMENT. The container runs"
+          echo "'alembic upgrade head' on start, so watch the logs for the migration."
