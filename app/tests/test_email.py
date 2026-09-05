@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
+from app.core.aws import get_client
 from app.core.config import get_settings
 from app.models.order import Order, OrderItem, OrderStatus
 from app.services import email_service
@@ -54,10 +55,10 @@ def _sending_enabled(monkeypatch):
     request leaves the process."""
     monkeypatch.setenv("EMAIL_BYPASS", "false")
     get_settings.cache_clear()
-    email_service._ses_client.cache_clear()
+    get_client.cache_clear()
     yield
     get_settings.cache_clear()
-    email_service._ses_client.cache_clear()
+    get_client.cache_clear()
 
 
 @pytest.fixture

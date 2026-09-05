@@ -21,28 +21,18 @@ worth an order for.
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from app.core.aws import get_client
 from app.core.config import get_settings
 from app.models.order import Order
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache
 def _ses_client():
-    """One client, reused. Creating one per send re-resolves credentials and
-    re-opens a connection for every message."""
-    settings = get_settings()
-    return boto3.client(
-        "ses",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key.get_secret_value(),
-    )
+    return get_client("ses")
 
 
 def _money(amount) -> str:

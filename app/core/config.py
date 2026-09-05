@@ -45,8 +45,15 @@ class Settings(BaseSettings):
     s3_bucket_name: str
     aws_region: str
     cloudfront_url: str  # e.g. https://d1234abcd.cloudfront.net
-    aws_access_key_id: str
-    aws_secret_access_key: SecretStr
+    # Optional, and empty is the right answer in a deployed environment.
+    #
+    # Locally there is an IAM user's key in .env, because a laptop has no role
+    # to assume. On App Runner there is an instance role, and boto3 finds it on
+    # its own as long as nothing hands it a key first - see app/core/aws.py.
+    # These were required until it turned out the App Runner stack sets neither,
+    # so the container could not start at all.
+    aws_access_key_id: str = ""
+    aws_secret_access_key: SecretStr = SecretStr("")
 
     # The app client access tokens must have been issued to. Optional so a local
     # .env predating this check still boots; required under APP_ENV=prod by the
