@@ -266,9 +266,18 @@ def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
             qty, name = demand.get(item.variant_id, (0, item.product_name))
             demand[item.variant_id] = (qty + item.quantity, name)
 
-    # Validate then deduct in one pass — avoids per-item checks that miss combined overstock
-    for variant_id, (qty, name) in demand.items():
-        variant = db.get(ProductVariant, variant_id)
+    # Validate then deduct in one pass — avoids per-item checks that miss combined overstock.
+    #
+    # Locked for the length of the transaction. Without it two admins confirming
+    # at the same moment both read the same stock, both pass the check, and both
+    # deduct: the last unit is sold twice and the count goes negative. The read
+    # and the write have to be one atomic step, which is what FOR UPDATE buys.
+    #
+    # Sorted so concurrent confirms take the rows in the same order. Two
+    # transactions locking the same two variants in opposite orders deadlock,
+    # and Postgres resolves that by killing one of them.
+    for variant_id, (qty, name) in sorted(demand.items(), key=lambda entry: str(entry[0])):
+        variant = db.get(ProductVariant, variant_id, with_for_update=True)
         if variant:
             if variant.stock < qty:
                 raise ValueError(
@@ -335,7 +344,9 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
     if order.status in (OrderStatus.confirmed, OrderStatus.shipped, OrderStatus.delivered):
         for item in order.items:
             if item.variant_id:
-                variant = db.get(ProductVariant, item.variant_id)
+                # Locked for the same reason as the deduction: a restore that
+                # reads a stale count writes one back.
+                variant = db.get(ProductVariant, item.variant_id, with_for_update=True)
                 if variant:
                     variant.stock += item.quantity
 
