@@ -3,14 +3,13 @@ import json
 import uuid
 from decimal import Decimal
 
-import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.dependencies.auth import require_user
+from app.dependencies.auth import require_user, verify_id_token
 from app.models.product_variant import ProductVariant
 from app.models.order import OrderStatus
 from app.schemas.order import CreatePaymentIntentRequest, OrderOut, PaymentIntentResponse
@@ -27,21 +26,38 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 
 def _get_customer_email(current_user: dict, id_token: str = "") -> str:
-    """Extract email from JWT claims (bypass) or from the forwarded ID token."""
+    """The customer's email, or "" if it cannot be established.
+
+    An access token carries no email claim, so the frontend forwards the id token
+    in X-Id-Token. That token is now fully verified - signature, issuer, audience
+    and token_use - rather than merely decoded.
+
+    It used to be read with the signature check disabled, on the grounds that the
+    value was only a hint and never an authorization decision. That was true of
+    how it is *used* and beside the point: the email is written onto the order
+    and shown in the admin console, so an unverified claim let any signed-in
+    customer put an arbitrary address - including someone else's - into the
+    record fulfilment works from.
+
+    Empty is an acceptable answer. A checkout must not fail over a missing email.
+    """
     email = current_user.get("email", "")
     if email:
         return email
     if not id_token:
         return ""
-    try:
-        payload = jwt.decode(id_token, options={"verify_signature": False})
-        if payload.get("token_use") != "id":
-            return ""
-        if payload.get("sub") != current_user.get("sub"):
-            return ""
-        return payload.get("email", "")
-    except Exception:
+
+    claims = verify_id_token(id_token)
+    if claims is None:
         return ""
+
+    # The id token must belong to the same person as the access token that
+    # authenticated this request, or a valid token borrowed from elsewhere would
+    # do just as well.
+    if claims.get("sub") != current_user.get("sub"):
+        return ""
+
+    return claims.get("email", "")
 
 
 def _idempotency_key(user_sub: str, payload: CreatePaymentIntentRequest, total_cents: int) -> str:
