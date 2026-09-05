@@ -155,3 +155,79 @@ def test_an_absent_key_is_left_to_the_production_guard():
     should not pre-empt it and report the wrong problem."""
     with pytest.raises(ValidationError, match="STRIPE_SECRET_KEY is required"):
         Settings(**{**LIVE_MODE, "stripe_secret_key": ""})
+
+
+# --- assembling DATABASE_URL ---
+#
+# A deployed environment cannot supply the URL: RDS generates the password into a
+# secret and App Runner injects it on its own, so the connection string has to be
+# built where the password is known.
+
+# database_url="" rather than omitted: conftest pins DATABASE_URL in os.environ
+# so the suite never inherits a developer's .env, and leaving the field out here
+# would simply pick that value up. Passing it empty is what actually exercises
+# the assembly path.
+DB_PARTS = {**BASE, "database_url": ""}
+
+
+def test_an_explicit_url_is_used_as_given():
+    """Local development, the test suite and docker-compose all set the URL
+    directly, and must keep working untouched."""
+    settings = Settings(**BASE)
+    assert settings.database_url == BASE["database_url"]
+
+
+def test_the_url_is_assembled_from_parts():
+    settings = Settings(
+        **DB_PARTS,
+        db_host="db.abc123.us-east-2.rds.amazonaws.com",
+        db_user="biofarm",
+        db_password="s3cret",
+    )
+    assert settings.database_url == (
+        "postgresql+psycopg://biofarm:s3cret@db.abc123.us-east-2.rds.amazonaws.com:5432/oasis"
+    )
+
+
+def test_an_explicit_url_wins_over_the_parts():
+    settings = Settings(**BASE, db_host="ignored", db_user="ignored", db_password="ignored")
+    assert settings.database_url == BASE["database_url"]
+
+
+def test_a_password_with_url_characters_is_encoded():
+    """RDS generates passwords from an alphabet that can include characters
+    SQLAlchemy would otherwise read as structure. An unencoded '/' or '@'
+    silently truncates the host, and it presents as an unreachable database
+    rather than as a bad password."""
+    settings = Settings(
+        **DB_PARTS, db_host="db.internal", db_user="biofarm", db_password="p@ss/w:rd#1"
+    )
+    assert "p%40ss%2Fw%3Ard%231" in settings.database_url
+    assert settings.database_url.endswith("@db.internal:5432/oasis")
+
+
+def test_a_custom_port_and_database_name_are_honoured():
+    settings = Settings(
+        **DB_PARTS,
+        db_host="db.internal",
+        db_user="biofarm",
+        db_password="pw",
+        db_port=6543,
+        db_name="other",
+    )
+    assert settings.database_url.endswith("@db.internal:6543/other")
+
+
+@pytest.mark.parametrize("missing", ["db_host", "db_user", "db_password"])
+def test_an_incomplete_set_of_parts_is_refused_by_name(missing):
+    """Naming the missing variable matters: this fails at container start, where
+    the only diagnostic is whatever this message says."""
+    parts = {"db_host": "h", "db_user": "u", "db_password": "p"}
+    parts[missing] = ""
+    with pytest.raises(ValidationError, match=missing.upper()):
+        Settings(**DB_PARTS, **parts)
+
+
+def test_neither_form_is_refused():
+    with pytest.raises(ValidationError, match="DATABASE_URL"):
+        Settings(**DB_PARTS)
