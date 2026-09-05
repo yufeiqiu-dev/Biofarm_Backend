@@ -19,7 +19,7 @@ class TaxResult:
 
 
 def _get_stripe():
-    stripe.api_key = get_settings().stripe_secret_key
+    stripe.api_key = get_settings().stripe_secret_key.get_secret_value()
     return stripe
 
 
@@ -134,4 +134,6 @@ def verify_webhook_signature(payload: bytes, sig_header: str) -> stripe.Event:
         event = stripe.Event.construct_from(data, stripe.api_key)
         return event
     s = _get_stripe()
-    return s.Webhook.construct_event(payload, sig_header, settings.stripe_webhook_secret)
+    return s.Webhook.construct_event(
+        payload, sig_header, settings.stripe_webhook_secret.get_secret_value()
+    )

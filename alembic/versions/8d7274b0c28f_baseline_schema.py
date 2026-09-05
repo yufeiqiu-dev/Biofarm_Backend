@@ -1,8 +1,8 @@
 """baseline schema
 
-Revision ID: fb9bf3a2bdc4
+Revision ID: 8d7274b0c28f
 Revises: 
-Create Date: 2026-09-03 23:20:02.364481
+Create Date: 2026-09-04 23:35:40.336109
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = 'fb9bf3a2bdc4'
+revision: str = '8d7274b0c28f'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -35,7 +35,7 @@ def upgrade() -> None:
     op.create_index(op.f('ix_checkout_sessions_stripe_pi_id'), 'checkout_sessions', ['stripe_pi_id'], unique=True)
     op.create_table('orders',
     sa.Column('id', sa.Uuid(), nullable=False),
-    sa.Column('order_number', sa.Integer(), nullable=False),
+    sa.Column('order_number', sa.String(length=16), nullable=False),
     sa.Column('user_id', sa.String(length=255), nullable=False),
     sa.Column('status', sa.Enum('pending', 'awaiting_fulfillment', 'confirmed', 'shipped', 'delivered', 'cancelled', name='orderstatus', native_enum=False, length=50), nullable=False),
     sa.Column('stripe_payment_intent_id', sa.String(length=255), nullable=False),

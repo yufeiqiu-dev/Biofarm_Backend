@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -11,17 +11,13 @@ from app.models.checkout_session import CheckoutSession
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
 from app.schemas.order import CartItemIn, ShippingIn
+from app.services.order_numbers import generate_order_number
 
 
-# How many times to re-derive an order number when another transaction takes the
-# one we picked. Each retry re-reads the maximum, so the only way to exhaust this
-# is that many orders committing inside one request - far beyond this catalog.
+# How many times to re-roll an order number when the generated one is already
+# taken. Against 32^8 possibilities a single collision is already unlikely; five
+# in a row is not worth planning for beyond failing loudly.
 _ORDER_NUMBER_ATTEMPTS = 5
-
-
-def _next_order_number(db: Session) -> int:
-    max_num = db.scalar(select(func.max(Order.order_number)))
-    return (max_num or 999) + 1
 
 
 def _load_order(db: Session, order_id: uuid.UUID) -> Order | None:
@@ -80,7 +76,7 @@ def create_order(
             }
         )
 
-    def build(order_number: int) -> Order:
+    def build(order_number: str) -> Order:
         return Order(
             order_number=order_number,
             user_id=user_id,
@@ -102,16 +98,13 @@ def create_order(
             items=[OrderItem(**values) for values in item_values],
         )
 
-    # order_number is "max + 1" over a unique column, which is a race: two
-    # checkouts landing together read the same maximum and the second insert
-    # violates the constraint. Unhandled that is a 500 on a request whose card is
-    # already authorized - the customer is charged and has no order.
-    #
-    # Retrying re-reads the maximum, so the loser of the race simply takes the
-    # next number. Chosen over a database sequence because it needs no migration
-    # and behaves the same on the SQLite engine the tests run against.
+    # The number is random rather than derived from what other rows hold, so the
+    # old read-then-write race is gone entirely. The retry stays for the far
+    # rarer case of two generated values colliding, and because an unhandled
+    # IntegrityError here is a 500 on a request whose card is already authorized
+    # - the customer charged, with no order.
     for attempt in range(_ORDER_NUMBER_ATTEMPTS):
-        order = build(_next_order_number(db))
+        order = build(generate_order_number())
         db.add(order)
         try:
             db.commit()

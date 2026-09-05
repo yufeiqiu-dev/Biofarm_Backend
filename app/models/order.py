@@ -24,7 +24,9 @@ class Order(Base):
     __tablename__ = "orders"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    order_number: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    # A random, customer-facing identifier - see services/order_numbers.py.
+    # Not sequential and not an ordering key: sort by created_at.
+    order_number: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)
     user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     status: Mapped[OrderStatus] = mapped_column(
         SAEnum(OrderStatus, native_enum=False, length=50),

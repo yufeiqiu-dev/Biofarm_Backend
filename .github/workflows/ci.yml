@@ -9,6 +9,9 @@ name: CI
 on:
   pull_request:
   push:
+    # exp only. staging and main are covered by deploy.yml, which repeats the
+    # migration check before it builds - a change pushed straight to a deploying
+    # branch must not reach App Runner unchecked.
     branches: [exp]
 
 jobs:
