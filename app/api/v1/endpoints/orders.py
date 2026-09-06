@@ -146,7 +146,14 @@ def initiate_checkout(
             idempotency_key=_idempotency_key(current_user["sub"], payload, tax_result.total_cents),
         )
         id_token = request.headers.get("X-Id-Token", "")
-        customer_email = _get_customer_email(current_user, id_token)
+        # What the customer asked for, falling back to the address on their
+        # account. Order mail is a notification, not a credential - nothing is
+        # authorised by it, and every order is scoped by user_id - so taking the
+        # customer's word for where to send it is safe. A lab ordering against a
+        # shared purchasing address cannot say so otherwise.
+        #
+        # The verified id-token address still earns its keep as that fallback.
+        customer_email = payload.contact_email or _get_customer_email(current_user, id_token)
 
         if get_settings().stripe_bypass:
             # No webhook in bypass mode — create the order immediately with mock card info
