@@ -21,6 +21,8 @@ import argparse
 import logging
 import sys
 
+from app.core.config import get_settings
+from app.core.logging import configure_logging
 from app.db.session import SessionLocal
 from app.services.order_service import cleanup_stale_checkout_sessions
 
@@ -44,7 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # The same configuration the service uses, so raising LOG_LEVEL affects the
+    # nightly sweep too. It used to hardcode INFO and ignore the setting.
+    configure_logging(get_settings().log_level)
 
     try:
         with SessionLocal() as db:

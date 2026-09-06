@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -23,13 +23,29 @@ class OrderStatus(enum.Enum):
 class Order(Base):
     __tablename__ = "orders"
 
+    __table_args__ = (
+        # The admin list is "newest first, optionally one status". Leading with
+        # status lets the same index serve both the filtered tabs and the
+        # unfiltered one, and having created_at in it means the page does not
+        # sort the whole table to return fifty rows.
+        Index("ix_orders_status_created_at", "status", "created_at"),
+        # The database should refuse what the application already refuses.
+        # Money is never negative here: a refund is a Stripe operation, not a
+        # negative order.
+        CheckConstraint("total_amount >= 0", name="ck_orders_total_not_negative"),
+        CheckConstraint("tax_amount >= 0", name="ck_orders_tax_not_negative"),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     # A random, customer-facing identifier - see services/order_numbers.py.
     # Not sequential and not an ordering key: sort by created_at.
     order_number: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)
     user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     status: Mapped[OrderStatus] = mapped_column(
-        SAEnum(OrderStatus, native_enum=False, length=50),
+        # create_constraint is False by default since SQLAlchemy 1.4, so this
+        # was a plain varchar(50) that would accept any string at all. The
+        # application validates on the way in; the database now does too.
+        SAEnum(OrderStatus, native_enum=False, length=50, create_constraint=True),
         nullable=False,
         default=OrderStatus.pending,
     )
@@ -63,12 +79,23 @@ class Order(Base):
 class OrderItem(Base):
     __tablename__ = "order_items"
 
+    __table_args__ = (
+        # A line for none of something is not a line. Nothing in the application
+        # writes one, which is exactly why it is cheap to guarantee.
+        CheckConstraint("quantity > 0", name="ck_order_items_quantity_positive"),
+        CheckConstraint("unit_price >= 0", name="ck_order_items_price_not_negative"),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     order_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True
     )
     variant_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("product_variants.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("product_variants.id", ondelete="SET NULL"),
+        nullable=True,
+        # Unindexed, the SET NULL on a variant delete scans every order item
+        # ever written.
+        index=True,
     )
     product_name: Mapped[str] = mapped_column(String(255), nullable=False)
     variant_label: Mapped[str] = mapped_column(String(100), nullable=False)

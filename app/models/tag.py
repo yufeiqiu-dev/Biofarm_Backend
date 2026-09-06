@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING, List
 
-from sqlalchemy import Column, ForeignKey, String, Table
+from sqlalchemy import Column, ForeignKey, Index, String, Table
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -17,6 +17,10 @@ product_tags = Table(
     Base.metadata,
     Column("product_id", ForeignKey("products.id", ondelete="CASCADE"), primary_key=True),
     Column("tag_id", ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
+    # The composite primary key indexes (product_id, tag_id), which answers
+    # "the tags on this product" but not "the products with this tag" - the
+    # direction the storefront filter actually asks in.
+    Index("ix_product_tags_tag_id", "tag_id"),
 )
 
 

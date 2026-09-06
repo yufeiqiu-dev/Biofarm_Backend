@@ -45,6 +45,28 @@ def configure_logging(level: str = "INFO") -> None:
 
     root.setLevel(_level_of(level))
 
+    # Third-party libraries that are unhelpful at DEBUG and are never what
+    # someone raising the level is trying to see. botocore in particular narrates
+    # every request and response it makes, which for SES means the message it is
+    # sending and who to.
+    #
+    # SQLAlchemy is deliberately not in this list. Its statement logging is
+    # gated on the engine's `echo` flag rather than on the logger level, and
+    # `echo` is only ever on when APP_ENV is "dev" - checked, not assumed: with
+    # echo off and the root logger at DEBUG, no statement or bound parameter is
+    # emitted. Clamping it here would only break the local SQL echo that dev
+    # deliberately turns on.
+    for noisy in ("botocore", "boto3", "urllib3", "s3transfer"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # In dev the engine is created with echo=True, and SQLAlchemy attaches its
+    # own handler when it finds none. Adding a root handler then prints every
+    # statement twice - once in SQLAlchemy's format and once in ours. Letting
+    # its handler own that output keeps the echo intact without the double.
+    engine_logger = logging.getLogger("sqlalchemy.engine")
+    if engine_logger.handlers:
+        engine_logger.propagate = False
+
 
 def _level_of(level: str) -> int:
     """A bad value should not stop the service from starting.
