@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -370,12 +370,61 @@ def cancel_order_by_customer(db: Session, order_id: uuid.UUID, user_id: str) -> 
     return order
 
 
-def list_all_orders(db: Session, status: OrderStatus | None = None) -> list[Order]:
+# One page of the admin order list. Large enough that the common case is a
+# single page, small enough that the response stays reasonable once there are
+# thousands of orders.
+DEFAULT_ORDER_PAGE_SIZE = 50
+MAX_ORDER_PAGE_SIZE = 200
+
+
+def list_all_orders(
+    db: Session,
+    status: OrderStatus | None = None,
+    search: str | None = None,
+    limit: int = DEFAULT_ORDER_PAGE_SIZE,
+    offset: int = 0,
+) -> tuple[list[Order], int]:
+    """One page of orders, and how many match in total.
+
+    Returns the count as well as the rows because a page of results is not
+    useful without knowing how many there are - the admin console cannot render
+    "showing 50 of ?" or decide whether a next page exists otherwise.
+
+    Searching happens here rather than in the browser. It used to be a client
+    filter over every order ever fetched, which worked only because the list was
+    unpaginated: the moment a page is a page, a client-side filter searches the
+    current page and quietly reports nothing for everything else.
+    """
+    limit = max(1, min(limit, MAX_ORDER_PAGE_SIZE))
+    offset = max(0, offset)
+
+    filters = []
+    if status:
+        filters.append(Order.status == status)
+
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        # The same fields the client filter covered, so the search box behaves
+        # as it did. ilike keeps it case-insensitive on Postgres; SQLite treats
+        # LIKE as case-insensitive for ASCII anyway, so the tests agree.
+        filters.append(
+            or_(
+                Order.order_number.ilike(term),
+                Order.customer_email.ilike(term),
+                Order.shipping_name.ilike(term),
+                Order.user_id.ilike(term),
+                cast(Order.id, String).ilike(term),
+            )
+        )
+
+    total = db.scalar(select(func.count()).select_from(Order).where(*filters)) or 0
+
     stmt = (
         select(Order)
+        .where(*filters)
         .options(selectinload(Order.items))
         .order_by(Order.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
-    if status:
-        stmt = stmt.where(Order.status == status)
-    return list(db.scalars(stmt).all())
+    return list(db.scalars(stmt).all()), total

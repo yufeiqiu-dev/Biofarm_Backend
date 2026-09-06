@@ -9,12 +9,14 @@ from app.db.session import get_db
 from app.dependencies.auth import require_admin
 from app.models.order import OrderStatus
 from app.models.product_variant import ProductVariant
-from app.schemas.order import AdminOrderItemOut, AdminOrderOut, UpdateOrderStatusRequest, UpdateTrackingRequest
+from app.schemas.order import AdminOrderItemOut, AdminOrderOut, AdminOrderPage, UpdateOrderStatusRequest, UpdateTrackingRequest
 from app.services.order_service import (
     cancel_order,
     confirm_order_admin,
     deliver_order,
     get_order_by_id,
+    DEFAULT_ORDER_PAGE_SIZE,
+    MAX_ORDER_PAGE_SIZE,
     list_all_orders,
     ship_order,
     update_tracking_number,
@@ -75,13 +77,20 @@ def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
     )
 
 
-@router.get("", response_model=list[AdminOrderOut])
+@router.get("", response_model=AdminOrderPage)
 def list_orders(
     # Named status_filter because a parameter called `status` shadows the
     # fastapi `status` module imported above - which is why this function alone
     # had to hardcode 400 where every sibling uses the constant. The alias keeps
     # the query string unchanged.
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    search: Optional[str] = Query(
+        default=None,
+        alias="q",
+        description="Matches order number, customer email, shipping name, user id or order id.",
+    ),
+    limit: int = Query(default=DEFAULT_ORDER_PAGE_SIZE, ge=1, le=MAX_ORDER_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
@@ -94,8 +103,15 @@ def list_orders(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid status: {status_filter}",
             )
-    orders = list_all_orders(db, order_status)
-    return [_build_admin_order_out(o, db) for o in orders]
+    orders, total = list_all_orders(
+        db, order_status, search=search, limit=limit, offset=offset
+    )
+    return AdminOrderPage(
+        items=[_build_admin_order_out(o, db) for o in orders],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{order_id}", response_model=AdminOrderOut)

@@ -94,3 +94,17 @@ class PaymentIntentResponse(BaseModel):
     order_id: Optional[uuid.UUID] = None  # only set in bypass mode
     subtotal_cents: int = 0
     tax_amount_cents: int = 0
+
+
+class AdminOrderPage(BaseModel):
+    """One page of the admin order list.
+
+    The count travels with the rows because a page is not useful on its own:
+    the console cannot say "50 of 340" or know whether a next page exists
+    without it.
+    """
+
+    items: list[AdminOrderOut]
+    total: int
+    limit: int
+    offset: int
