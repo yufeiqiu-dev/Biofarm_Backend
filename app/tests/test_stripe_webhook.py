@@ -4,6 +4,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.models.checkout_session import CheckoutSession
 from app.models.order import Order, OrderItem, OrderStatus
@@ -299,3 +300,77 @@ def test_a_card_lookup_failure_does_not_block_the_order(client: TestClient, db_s
     order = db_session.query(Order).filter_by(stripe_payment_intent_id=pi_id).one()
     assert order.status == OrderStatus.awaiting_fulfillment
     assert order.card_brand == ""
+
+
+def test_webhook_sold_out_voids_the_auth_and_acknowledges(client, db_session):
+    """Stock ran out between the customer paying and this webhook arriving.
+
+    There is no order to create and the card is authorised. Returning 500 is how
+    Stripe is told to retry, and it would retry for days on something that can
+    never succeed, leaving the authorisation live until it expired. So the
+    authorisation is voided and the event acknowledged.
+    """
+    variant = make_product_and_variant(db_session)
+    variant.stock = 0
+    db_session.commit()
+
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    with patch("app.api.v1.endpoints.stripe_webhook.cancel_payment_intent") as void:
+        response = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
+
+    assert response.status_code == 200, "a 500 here buys days of pointless Stripe retries"
+    void.assert_called_once_with(pi_id)
+
+    # No order, and the session is gone so a retry does not re-attempt it.
+    assert db_session.scalar(
+        select(Order).where(Order.stripe_payment_intent_id == pi_id)
+    ) is None
+    assert db_session.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == pi_id)
+    ) is None
+
+
+def test_webhook_keeps_the_session_when_the_void_fails(client, db_session):
+    """If the authorisation cannot be voided, the session must survive.
+
+    Deleting it first would send Stripe's retry down the "no session and no
+    order" path, which 500s forever and never retries the void.
+    """
+    variant = make_product_and_variant(db_session)
+    variant.stock = 0
+    db_session.commit()
+
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    with patch("app.api.v1.endpoints.stripe_webhook.cancel_payment_intent",
+               side_effect=RuntimeError("stripe is down")):
+        try:
+            post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
+        except RuntimeError:
+            pass  # TestClient re-raises; a real deployment returns 500 and Stripe retries
+
+    assert db_session.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == pi_id)
+    ) is not None, "the session was consumed, so the retry can never void the auth"
+
+
+def test_webhook_still_creates_the_order_when_stock_is_there(client, db_session):
+    """The guard must not have changed the ordinary path, and it takes stock."""
+    variant = make_product_and_variant(db_session)
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    response = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
+
+    assert response.status_code == 200
+    order = db_session.scalar(select(Order).where(Order.stripe_payment_intent_id == pi_id))
+    assert order is not None
+    assert order.status == OrderStatus.awaiting_fulfillment
+
+    db_session.expire_all()
+    assert db_session.get(ProductVariant, variant.id).stock == 4, (
+        "creating the order did not take the stock"
+    )

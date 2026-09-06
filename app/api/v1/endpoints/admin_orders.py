@@ -1,6 +1,9 @@
+import logging
+import re
 import uuid
 from typing import Optional
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -9,17 +12,22 @@ from app.db.session import get_db
 from app.dependencies.auth import require_admin
 from app.models.order import OrderStatus
 from app.models.product_variant import ProductVariant
-from app.schemas.order import AdminOrderItemOut, AdminOrderOut, UpdateOrderStatusRequest, UpdateTrackingRequest
+from app.schemas.order import AdminOrderItemOut, AdminOrderOut, AdminOrderPage, UpdateOrderStatusRequest, UpdateTrackingRequest
 from app.services.order_service import (
     cancel_order,
     confirm_order_admin,
     deliver_order,
     get_order_by_id,
+    DEFAULT_ORDER_PAGE_SIZE,
+    MAX_ORDER_PAGE_SIZE,
     list_all_orders,
     ship_order,
     update_tracking_number,
 )
+from app.services.cognito_service import get_account
 from app.services.stripe_service import cancel_payment_intent, capture_payment_intent, create_refund
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/orders", tags=["admin-orders"])
 
@@ -75,13 +83,61 @@ def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
     )
 
 
-@router.get("", response_model=list[AdminOrderOut])
+# Only decides whether a Cognito lookup is worth attempting, so it is loose on
+# purpose - a false positive costs one lookup, which is then cached as a miss.
+#
+# It does not, and cannot, promise that a half-typed address never resolves:
+# "alice@lab.co" is both a real address and a prefix of "alice@lab.com". What
+# actually bounds the calls is the console's 300ms debounce and the negative
+# cache; the two-character minimum below just removes the noisiest case, since a
+# pause mid-TLD is where typing most often stops.
+_LOOKS_LIKE_EMAIL = re.compile(r"\A[^@\s]+@[^@\s]+\.[^@\s]{2,}\Z")
+
+
+def _sub_for_search(search: Optional[str]) -> Optional[str]:
+    """The account behind a searched-for email address, if there is one.
+
+    The point of the whole thing: `customer_email` holds where the customer
+    asked order mail to go, and support hears about it precisely when that was
+    wrong. Searching the address they actually have would otherwise match
+    nothing, and the admin would have to know to look up a sub by hand.
+
+    Never raises. A search must not fail because Cognito is unreachable - the
+    text matches are still worth returning, and an admin who gets an error
+    instead of a partial result has no way to tell the difference between
+    "no such customer" and "AWS is down".
+    """
+    if not search or not _LOOKS_LIKE_EMAIL.match(search.strip()):
+        return None
+
+    try:
+        account = get_account(search.strip())
+    except (ValueError, BotoCoreError, ClientError):
+        logger.warning("could not resolve %r to an account; searching text only", search)
+        return None
+
+    return account["sub"] if account else None
+
+
+@router.get("", response_model=AdminOrderPage)
 def list_orders(
     # Named status_filter because a parameter called `status` shadows the
     # fastapi `status` module imported above - which is why this function alone
     # had to hardcode 400 where every sibling uses the constant. The alias keeps
     # the query string unchanged.
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    search: Optional[str] = Query(
+        default=None,
+        alias="q",
+        description=(
+            "Matches order number, customer email, shipping name, user id or "
+            "order id. An email is also resolved against Cognito, so a customer's "
+            "own address finds their orders even when they sent the confirmation "
+            "somewhere else."
+        ),
+    ),
+    limit: int = Query(default=DEFAULT_ORDER_PAGE_SIZE, ge=1, le=MAX_ORDER_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
@@ -94,8 +150,20 @@ def list_orders(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid status: {status_filter}",
             )
-    orders = list_all_orders(db, order_status)
-    return [_build_admin_order_out(o, db) for o in orders]
+    orders, total = list_all_orders(
+        db,
+        order_status,
+        search=search,
+        also_user_id=_sub_for_search(search),
+        limit=limit,
+        offset=offset,
+    )
+    return AdminOrderPage(
+        items=[_build_admin_order_out(o, db) for o in orders],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{order_id}", response_model=AdminOrderOut)

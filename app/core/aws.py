@@ -30,16 +30,22 @@ from app.core.config import get_settings
 
 
 @lru_cache
-def get_client(service_name: str):
+def get_client(service_name: str, region_name: str | None = None):
     """A boto3 client for `service_name`, cached.
 
     Cached because boto3 parses the full service model on every `client()` call,
     which is tens of milliseconds paid on every presign, every delete and every
     message for no reason. The clients used here are thread-safe.
+
+    `region_name` overrides the default for services that do not live in
+    `aws_region`. The user pool has its own `cognito_region` setting and there is
+    no reason the two must agree - resolving a sub against the wrong region
+    silently finds nobody, which reads as "no such account" rather than as a
+    misconfiguration.
     """
     settings = get_settings()
 
-    kwargs = {"region_name": settings.aws_region}
+    kwargs = {"region_name": region_name or settings.aws_region}
 
     # Only when there is something to pass. Handing boto3 an empty string is not
     # the same as handing it nothing: it would take the empty credential as the

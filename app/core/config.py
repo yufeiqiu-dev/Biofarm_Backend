@@ -15,6 +15,10 @@ STRIPE_MODES = {"test": "sk_test_", "live": "sk_live_"}
 class Settings(BaseSettings):
     app_name: str = "oasis-backend"
     app_env: str = "dev"
+
+    log_level: str = "INFO"
+    """Root log level. An unknown value falls back to INFO rather than refusing
+    to start - see app/core/logging.py."""
     api_v1_prefix: str = "/api/v1"
 
     # Override in production with the deployed frontend origin

@@ -11,7 +11,11 @@ from app.services.order_service import (
     delete_checkout_session,
     get_order_by_payment_intent,
 )
-from app.services.stripe_service import get_card_details, verify_webhook_signature
+from app.services.stripe_service import (
+    cancel_payment_intent,
+    get_card_details,
+    verify_webhook_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +52,30 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     if event.type in ("payment_intent.amount_capturable_updated", "payment_intent.succeeded"):
         pi = event.data.object
         card_brand, card_last4 = await _extract_card_info(pi)
-        order = create_order_from_checkout_session(
-            db, pi.id, card_brand=card_brand, card_last4=card_last4
-        )
+        try:
+            order = create_order_from_checkout_session(
+                db, pi.id, card_brand=card_brand, card_last4=card_last4
+            )
+        except ValueError as exc:
+            # Sold out between the customer paying and this webhook arriving.
+            # Stock is taken when the order is created, so there is no order and
+            # nothing to fulfil - but the card is authorised.
+            #
+            # Letting this escape would return 500, which is how Stripe is told
+            # to retry: it would retry for days, fail identically every time, and
+            # leave the authorisation live until it expired on its own. So the
+            # authorisation is voided and the event is acknowledged.
+            logger.error(
+                "webhook %s for payment intent %s: %s - voiding the authorisation",
+                event.type, pi.id, exc,
+            )
+            # Before deleting the session, deliberately. If the void fails this
+            # raises, the session survives, and Stripe's retry brings us back
+            # here to try again. Deleting first would send the retry down the
+            # "no session and no order" path instead, which 500s forever.
+            await asyncio.to_thread(cancel_payment_intent, pi.id)
+            delete_checkout_session(db, pi.id)
+            return {"status": "ok"}
 
         if order is None:
             # No checkout session matched. Either this intent was already
