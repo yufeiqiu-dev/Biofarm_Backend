@@ -1,5 +1,6 @@
 import json
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -35,6 +36,80 @@ def _load_order_by_pi(db: Session, pi_id: str) -> Order | None:
         .options(selectinload(Order.items))
         .where(Order.stripe_payment_intent_id == pi_id)
     )
+
+
+def _aggregate_demand(
+    entries: "Iterable[tuple[uuid.UUID | None, int, str]]",
+) -> dict[uuid.UUID, tuple[int, str]]:
+    """Collapse (variant_id, quantity, product_name) triples per variant.
+
+    A cart, and an order, may legitimately hold two lines for the same variant.
+    Checking them one at a time passes each on its own and misses the combined
+    total, which is how an order for 3 + 3 of a variant holding 5 used to get
+    through. The name is kept only so the error can say what ran out.
+
+    Entries with no variant_id are skipped: OrderItem.variant_id is
+    ON DELETE SET NULL, so an order outliving its product has nothing to return
+    stock to.
+    """
+    demand: dict[uuid.UUID, tuple[int, str]] = {}
+    for variant_id, quantity, name in entries:
+        if variant_id is None:
+            continue
+        running, first_name = demand.get(variant_id, (0, name))
+        demand[variant_id] = (running + quantity, first_name)
+    return demand
+
+
+def _lock_in_order(db: Session, demand: dict[uuid.UUID, tuple[int, str]]):
+    """Yield (variant, quantity, name) with every row locked for the transaction.
+
+    Sorted by id so concurrent transactions take the same rows in the same
+    order. Two of them locking the same two variants in opposite orders deadlock,
+    and Postgres resolves that by killing one.
+
+    populate_existing is not optional here, and its absence does not look like a
+    bug. create_order loads the variants before it reaches this, so they are
+    already in the identity map - and Session.get() will happily take the lock
+    while leaving those stale attributes untouched. The row is then correctly
+    locked and the value read from it is the one fetched before waiting, which is
+    exactly the lost update the lock is meant to prevent: measured against real
+    Postgres, two buyers both took the last unit and both got an order. SQLite
+    cannot reproduce it, so no amount of running the suite would have shown it.
+    """
+    for variant_id, (quantity, name) in sorted(demand.items(), key=lambda e: str(e[0])):
+        variant = db.get(
+            ProductVariant, variant_id, with_for_update=True, populate_existing=True
+        )
+        if variant is not None:
+            yield variant, quantity, name
+
+
+def _take_stock(db: Session, demand: dict[uuid.UUID, tuple[int, str]]) -> None:
+    """Deduct, or raise having changed nothing.
+
+    Validated in full before anything is written, so a cart whose third variant
+    is short does not leave the first two decremented for the caller to unpick.
+    The lock makes the read and the write one atomic step - without it two
+    transactions read the same count, both pass, and both deduct.
+    """
+    locked: list[tuple[ProductVariant, int]] = []
+    for variant, quantity, name in _lock_in_order(db, demand):
+        if variant.stock < quantity:
+            raise ValueError(
+                f"Insufficient stock for {name}: need {quantity}, only {variant.stock} available"
+            )
+        locked.append((variant, quantity))
+
+    for variant, quantity in locked:
+        variant.stock -= quantity
+
+
+def _return_stock(db: Session, demand: dict[uuid.UUID, tuple[int, str]]) -> None:
+    """Give stock back. Locked for the same reason: a restore that reads a stale
+    count writes one back."""
+    for variant, quantity, _name in _lock_in_order(db, demand):
+        variant.stock += quantity
 
 
 def create_order(
@@ -104,11 +179,27 @@ def create_order(
     # rarer case of two generated values colliding, and because an unhandled
     # IntegrityError here is a 500 on a request whose card is already authorized
     # - the customer charged, with no order.
+    # Aggregated once: the demand does not change between retries, and
+    # item_values has already resolved every name and rejected a missing variant.
+    demand = _aggregate_demand(
+        (values["variant_id"], values["quantity"], values["product_name"])
+        for values in item_values
+    )
+
     for attempt in range(_ORDER_NUMBER_ATTEMPTS):
         order = build(generate_order_number())
         db.add(order)
         try:
+            # Inside the loop, not before it: the rollback below undoes the
+            # deduction along with the order, so each attempt has to take it
+            # again. Stock and order commit together or not at all.
+            _take_stock(db, demand)
             db.commit()
+        except ValueError:
+            # Out of stock. No retry will change that, and the order must not
+            # survive the attempt that failed.
+            db.rollback()
+            raise
         except IntegrityError:
             db.rollback()
             # orders has a second unique column, stripe_payment_intent_id, and
@@ -259,32 +350,12 @@ def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
     if order.status != OrderStatus.awaiting_fulfillment:
         raise ValueError(f"Cannot confirm order in status {order.status.value}")
 
-    # Aggregate demand per variant (an order may have multiple items for the same variant)
-    demand: dict[uuid.UUID, tuple[int, str]] = {}  # variant_id → (total_qty, product_name)
-    for item in order.items:
-        if item.variant_id:
-            qty, name = demand.get(item.variant_id, (0, item.product_name))
-            demand[item.variant_id] = (qty + item.quantity, name)
-
-    # Validate then deduct in one pass — avoids per-item checks that miss combined overstock.
-    #
-    # Locked for the length of the transaction. Without it two admins confirming
-    # at the same moment both read the same stock, both pass the check, and both
-    # deduct: the last unit is sold twice and the count goes negative. The read
-    # and the write have to be one atomic step, which is what FOR UPDATE buys.
-    #
-    # Sorted so concurrent confirms take the rows in the same order. Two
-    # transactions locking the same two variants in opposite orders deadlock,
-    # and Postgres resolves that by killing one of them.
-    for variant_id, (qty, name) in sorted(demand.items(), key=lambda entry: str(entry[0])):
-        variant = db.get(ProductVariant, variant_id, with_for_update=True)
-        if variant:
-            if variant.stock < qty:
-                raise ValueError(
-                    f"Insufficient stock for {name}: need {qty}, only {variant.stock} available"
-                )
-            variant.stock -= qty
-
+    # Deliberately does not touch stock. It was taken when the order was
+    # created, so by the time an admin gets here the inventory is already set
+    # aside and confirming cannot fail on it. It used to deduct, which meant the
+    # moment an admin happened to click was what decided whether inventory
+    # moved - and a second customer who had already paid for the last unit only
+    # found out when this raised.
     order.status = OrderStatus.confirmed
     db.commit()
     db.refresh(order)
@@ -340,15 +411,17 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
     if order.status == OrderStatus.cancelled:
         raise ValueError(f"Order is already cancelled")
 
-    # Stock was deducted at confirm — restore it if cancelling after that point
-    if order.status in (OrderStatus.confirmed, OrderStatus.shipped, OrderStatus.delivered):
-        for item in order.items:
-            if item.variant_id:
-                # Locked for the same reason as the deduction: a restore that
-                # reads a stale count writes one back.
-                variant = db.get(ProductVariant, item.variant_id, with_for_update=True)
-                if variant:
-                    variant.stock += item.quantity
+    # Unconditional, because every order that exists holds its stock from the
+    # moment it was created. This used to be conditional on having passed
+    # confirm, which was the only point stock moved; now the guard above -
+    # refusing an already-cancelled order - is the only thing standing between
+    # this and a double restore.
+    _return_stock(
+        db,
+        _aggregate_demand(
+            (item.variant_id, item.quantity, item.product_name) for item in order.items
+        ),
+    )
 
     order.status = OrderStatus.cancelled
     db.commit()

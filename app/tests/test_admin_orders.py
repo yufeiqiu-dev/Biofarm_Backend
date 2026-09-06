@@ -99,8 +99,12 @@ def test_admin_confirm_order_does_not_capture(admin_client: TestClient, db_sessi
     mock_capture.assert_not_called()
 
 
-def test_admin_confirm_order_deducts_stock(admin_client: TestClient, db_session):
-    """Confirming deducts stock — admin is setting aside inventory."""
+def test_admin_confirm_order_leaves_stock_alone(admin_client: TestClient, db_session):
+    """Confirming does not move stock — it was taken when the order was created.
+
+    This asserted the opposite until stock moved to creation. Confirming is now
+    only an acknowledgement, and the inventory was already set aside.
+    """
     order, variant = make_order_for_admin(db_session, qty=2, stock=5)
 
     with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent"):
@@ -110,24 +114,32 @@ def test_admin_confirm_order_deducts_stock(admin_client: TestClient, db_session)
         )
     assert response.status_code == 200
     db_session.refresh(variant)
-    assert variant.stock == 3
+    assert variant.stock == 5
 
 
-def test_admin_confirm_order_insufficient_stock_returns_400(admin_client: TestClient, db_session):
-    """Confirming an order with insufficient stock is blocked."""
-    order, variant = make_order_for_admin(db_session, qty=3, stock=2)
+def test_admin_confirm_order_cannot_fail_on_stock(admin_client: TestClient, db_session):
+    """A variant at zero no longer blocks confirming an order that holds it.
 
-    response = admin_client.patch(
-        f"/api/v1/admin/orders/{order.id}/status",
-        json={"status": "confirmed"},
-    )
-    assert response.status_code == 400
+    This is the admin-facing symptom the change exists to remove. The order's
+    own stock was taken at creation, so a variant now reading zero means it has
+    all been allocated - not that this order cannot be honoured. Confirming used
+    to 400 here, stranding an order whose card was already authorised.
+    """
+    order, variant = make_order_for_admin(db_session, qty=3, stock=0)
+
+    with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent"):
+        response = admin_client.patch(
+            f"/api/v1/admin/orders/{order.id}/status",
+            json={"status": "confirmed"},
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "confirmed"
     db_session.refresh(variant)
-    assert variant.stock == 2  # unchanged
+    assert variant.stock == 0
 
 
 def test_admin_ship_order_captures_no_stock_change(admin_client: TestClient, db_session):
-    """Shipping captures payment; stock was already deducted at confirm."""
+    """Shipping captures payment and leaves stock alone - it moved at creation."""
     order, variant = make_order_for_admin(db_session, status=OrderStatus.confirmed, qty=1, stock=4)
 
     with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent") as mock_capture:
@@ -140,7 +152,7 @@ def test_admin_ship_order_captures_no_stock_change(admin_client: TestClient, db_
     mock_capture.assert_called_once_with(order.stripe_payment_intent_id)
 
     db_session.refresh(variant)
-    assert variant.stock == 4  # unchanged — deducted at confirm, not ship
+    assert variant.stock == 4  # unchanged — taken at creation, not at ship
 
 
 def test_admin_cancel_confirmed_restores_stock(admin_client: TestClient, db_session):

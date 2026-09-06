@@ -58,7 +58,11 @@ def make_order(db_session, user_id: str = "test-user-123", status: OrderStatus =
 
 # --- order_service tests ---
 
-def test_ship_order_deducts_stock(db_session):
+def test_confirming_and_shipping_leave_stock_alone(db_session):
+    """Neither step moves inventory; it was taken when the order was created.
+
+    Named for deduction until stock moved to creation, and it asserted 4 here.
+    """
     from app.services.order_service import confirm_order_admin, ship_order
 
     order, variant = make_order(db_session, stock=5)
@@ -69,7 +73,7 @@ def test_ship_order_deducts_stock(db_session):
     assert result is not None
     assert result.status == OrderStatus.shipped
     db_session.refresh(variant)
-    assert variant.stock == 4
+    assert variant.stock == 5
 
 
 def test_ship_order_wrong_status_raises(db_session):
