@@ -330,7 +330,11 @@ def get_orders_for_user(db: Session, user_id: str) -> list[Order]:
             select(Order)
             .options(selectinload(Order.items))
             .where(Order.user_id == user_id)
-            .order_by(Order.created_at.desc())
+            # id as a tiebreaker: created_at is not unique, and Postgres now() is
+        # transaction-start, so anything seeded or backfilled together ties. With
+        # ties, LIMIT/OFFSET has no defined order between the count query and the
+        # page query - a row can appear on two pages, or on none.
+        .order_by(Order.created_at.desc(), Order.id.desc())
         ).all()
     )
 
@@ -431,16 +435,24 @@ def cancel_order(db: Session, order_id: uuid.UUID) -> Order:
 
 
 def cancel_order_by_customer(db: Session, order_id: uuid.UUID, user_id: str) -> Order:
+    """A customer cancelling their own order.
+
+    Ownership and which statuses they may cancel from are decided here; what
+    cancelling *means* is deferred to cancel_order, which returns the stock.
+
+    That delegation is the point. This used to set the status and commit
+    directly, which was correct while stock moved at confirm - the statuses
+    allowed here held none. Once every order held stock from creation, the
+    duplicate quietly became an inventory leak: the admin path returned stock
+    and this one destroyed it. One implementation cannot drift from itself.
+    """
     order = _load_order(db, order_id)
     if order is None or order.user_id != user_id:
         raise ValueError("Order not found")
-    if order.status != OrderStatus.awaiting_fulfillment:
+    if order.status not in (OrderStatus.pending, OrderStatus.awaiting_fulfillment):
         raise ValueError(f"Cannot cancel order in status {order.status.value}")
-    order.status = OrderStatus.cancelled
-    db.commit()
-    db.refresh(order)
-    email_service.send_order_cancelled(order)
-    return order
+
+    return cancel_order(db, order_id)
 
 
 # One page of the admin order list. Large enough that the common case is a
@@ -512,7 +524,11 @@ def list_all_orders(
         select(Order)
         .where(*filters)
         .options(selectinload(Order.items))
-        .order_by(Order.created_at.desc())
+        # id as a tiebreaker: created_at is not unique, and Postgres now() is
+        # transaction-start, so anything seeded or backfilled together ties. With
+        # ties, LIMIT/OFFSET has no defined order between the count query and the
+        # page query - a row can appear on two pages, or on none.
+        .order_by(Order.created_at.desc(), Order.id.desc())
         .limit(limit)
         .offset(offset)
     )

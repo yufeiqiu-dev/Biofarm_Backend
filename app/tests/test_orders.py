@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -332,3 +333,38 @@ def test_the_nominated_address_survives_the_webhook(user_client: TestClient, db_
 
     assert order is not None
     assert order.customer_email == "purchasing@lab.edu"
+
+
+def test_the_order_page_query_breaks_ties_on_a_unique_column(db_session):
+    """created_at is not unique, and Postgres now() is transaction-start - so
+    anything written in one transaction ties. With ties, LIMIT/OFFSET has no
+    defined order between the count query and the page query: a row can appear
+    on two pages, or on none.
+
+    Asserted on the SQL rather than on the outcome, because SQLite returns rows
+    in rowid order whether or not a tiebreaker is asked for - a behavioural test
+    here passes with the bug present, which is worse than no test. Same reason
+    test_stock_locking asserts that the lock is *requested*.
+    """
+    from sqlalchemy import event
+
+    from app.services.order_service import list_all_orders
+
+    make_order(db_session)
+    bind = db_session.get_bind()
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(bind, "before_cursor_execute", record)
+    try:
+        list_all_orders(db_session, None, limit=4, offset=0)
+    finally:
+        event.remove(bind, "before_cursor_execute", record)
+
+    ordered = [s for s in statements if "ORDER BY" in s.upper()]
+    assert ordered, "the page query has no ORDER BY at all"
+    for statement in ordered:
+        clause = statement.upper().split("ORDER BY", 1)[1]
+        assert "ID" in clause, f"no unique tiebreaker in: {clause.strip()[:80]}"
