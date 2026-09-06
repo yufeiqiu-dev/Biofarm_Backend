@@ -1,9 +1,10 @@
+import re
 import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.order import OrderStatus
 from app.schemas.numeric import Money
@@ -27,9 +28,35 @@ class ShippingIn(BaseModel):
     notes: Optional[str] = None
 
 
+# Deliberately not pydantic's EmailStr, which needs the email-validator package -
+# a dependency for one field. This catches a typo; nothing short of sending to it
+# proves an address is real, and SES bouncing is the check that actually counts.
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
 class CreatePaymentIntentRequest(BaseModel):
     cart: list[CartItemIn] = Field(..., min_length=1)
     shipping: ShippingIn
+    # Where the customer wants order mail sent. Optional: blank falls back to the
+    # address on their Cognito account, which is the verified one.
+    contact_email: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("contact_email")
+    @classmethod
+    def _normalise_contact_email(cls, value: Optional[str]) -> Optional[str]:
+        """An empty field means "use my account address", not "invalid".
+
+        The frontend sends "" for an untouched input, so treating blank as a
+        validation failure would 422 every checkout that did not customise it.
+        """
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not _EMAIL.fullmatch(cleaned):
+            raise ValueError("Enter a valid email address")
+        return cleaned
 
 
 class UpdateOrderStatusRequest(BaseModel):
@@ -94,3 +121,17 @@ class PaymentIntentResponse(BaseModel):
     order_id: Optional[uuid.UUID] = None  # only set in bypass mode
     subtotal_cents: int = 0
     tax_amount_cents: int = 0
+
+
+class AdminOrderPage(BaseModel):
+    """One page of the admin order list.
+
+    The count travels with the rows because a page is not useful on its own:
+    the console cannot say "50 of 340" or know whether a next page exists
+    without it.
+    """
+
+    items: list[AdminOrderOut]
+    total: int
+    limit: int
+    offset: int

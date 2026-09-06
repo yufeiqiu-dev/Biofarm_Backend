@@ -61,7 +61,7 @@ def test_admin_list_orders(admin_client: TestClient, db_session):
 
     response = admin_client.get("/api/v1/admin/orders")
     assert response.status_code == 200
-    assert len(response.json()) >= 2
+    assert len(response.json()["items"]) >= 2
 
 
 def test_admin_list_orders_status_filter(admin_client: TestClient, db_session):
@@ -70,7 +70,7 @@ def test_admin_list_orders_status_filter(admin_client: TestClient, db_session):
 
     response = admin_client.get("/api/v1/admin/orders?status=shipped")
     assert response.status_code == 200
-    data = response.json()
+    data = response.json()["items"]
     assert all(o["status"] == "shipped" for o in data)
 
 
@@ -99,8 +99,12 @@ def test_admin_confirm_order_does_not_capture(admin_client: TestClient, db_sessi
     mock_capture.assert_not_called()
 
 
-def test_admin_confirm_order_deducts_stock(admin_client: TestClient, db_session):
-    """Confirming deducts stock — admin is setting aside inventory."""
+def test_admin_confirm_order_leaves_stock_alone(admin_client: TestClient, db_session):
+    """Confirming does not move stock — it was taken when the order was created.
+
+    This asserted the opposite until stock moved to creation. Confirming is now
+    only an acknowledgement, and the inventory was already set aside.
+    """
     order, variant = make_order_for_admin(db_session, qty=2, stock=5)
 
     with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent"):
@@ -110,24 +114,32 @@ def test_admin_confirm_order_deducts_stock(admin_client: TestClient, db_session)
         )
     assert response.status_code == 200
     db_session.refresh(variant)
-    assert variant.stock == 3
+    assert variant.stock == 5
 
 
-def test_admin_confirm_order_insufficient_stock_returns_400(admin_client: TestClient, db_session):
-    """Confirming an order with insufficient stock is blocked."""
-    order, variant = make_order_for_admin(db_session, qty=3, stock=2)
+def test_admin_confirm_order_cannot_fail_on_stock(admin_client: TestClient, db_session):
+    """A variant at zero no longer blocks confirming an order that holds it.
 
-    response = admin_client.patch(
-        f"/api/v1/admin/orders/{order.id}/status",
-        json={"status": "confirmed"},
-    )
-    assert response.status_code == 400
+    This is the admin-facing symptom the change exists to remove. The order's
+    own stock was taken at creation, so a variant now reading zero means it has
+    all been allocated - not that this order cannot be honoured. Confirming used
+    to 400 here, stranding an order whose card was already authorised.
+    """
+    order, variant = make_order_for_admin(db_session, qty=3, stock=0)
+
+    with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent"):
+        response = admin_client.patch(
+            f"/api/v1/admin/orders/{order.id}/status",
+            json={"status": "confirmed"},
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "confirmed"
     db_session.refresh(variant)
-    assert variant.stock == 2  # unchanged
+    assert variant.stock == 0
 
 
 def test_admin_ship_order_captures_no_stock_change(admin_client: TestClient, db_session):
-    """Shipping captures payment; stock was already deducted at confirm."""
+    """Shipping captures payment and leaves stock alone - it moved at creation."""
     order, variant = make_order_for_admin(db_session, status=OrderStatus.confirmed, qty=1, stock=4)
 
     with patch("app.api.v1.endpoints.admin_orders.capture_payment_intent") as mock_capture:
@@ -140,7 +152,7 @@ def test_admin_ship_order_captures_no_stock_change(admin_client: TestClient, db_
     mock_capture.assert_called_once_with(order.stripe_payment_intent_id)
 
     db_session.refresh(variant)
-    assert variant.stock == 4  # unchanged — deducted at confirm, not ship
+    assert variant.stock == 4  # unchanged — taken at creation, not at ship
 
 
 def test_admin_cancel_confirmed_restores_stock(admin_client: TestClient, db_session):
@@ -284,7 +296,7 @@ def test_status_filter_still_answers_to_the_status_query_parameter(admin_client,
     response = admin_client.get("/api/v1/admin/orders?status=delivered")
 
     assert response.status_code == 200
-    assert [o["status"] for o in response.json()] == ["delivered"]
+    assert [o["status"] for o in response.json()["items"]] == ["delivered"]
 
 
 def test_an_unknown_status_is_a_400_from_the_shared_constant(admin_client):
@@ -304,4 +316,141 @@ def test_no_status_returns_every_order(admin_client, db_session):
     response = admin_client.get("/api/v1/admin/orders")
 
     assert response.status_code == 200
-    assert len(response.json()) == 2
+    assert response.json()["total"] == 2
+    assert len(response.json()["items"]) == 2
+
+
+# --- paging and search ---
+
+def test_a_page_reports_how_many_orders_there_are_in_total(admin_client, db_session):
+    """A page is not useful on its own. Without the count the console cannot say
+    "50 of 340", and cannot know whether a next page exists."""
+    for _ in range(3):
+        make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    response = admin_client.get("/api/v1/admin/orders?limit=2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 2
+    assert body["total"] == 3
+    assert body["limit"] == 2
+    assert body["offset"] == 0
+
+
+def test_paging_walks_the_whole_list_without_repeating_an_order(admin_client, db_session):
+    for _ in range(5):
+        make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    first = admin_client.get("/api/v1/admin/orders?limit=2&offset=0").json()["items"]
+    second = admin_client.get("/api/v1/admin/orders?limit=2&offset=2").json()["items"]
+    third = admin_client.get("/api/v1/admin/orders?limit=2&offset=4").json()["items"]
+
+    seen = [o["id"] for o in first + second + third]
+    assert len(seen) == 5
+    assert len(set(seen)) == 5, "an order appeared on two pages"
+
+
+def test_search_finds_an_order_by_its_number(admin_client, db_session):
+    """Search runs on the server now. It used to be a client filter over every
+    order ever fetched, which only worked because the list was unpaginated - the
+    moment a page is a page, that filter searches one page and silently reports
+    nothing for the rest."""
+    target, _ = make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+    make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    response = admin_client.get(f"/api/v1/admin/orders?q={target.order_number}")
+
+    body = response.json()
+    assert body["total"] == 1
+    assert body["items"][0]["order_number"] == target.order_number
+
+
+def test_search_matches_a_partial_email_case_insensitively(admin_client, db_session):
+    order, _ = make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+    order.customer_email = "Researcher@Example.COM"
+    # A second order that must NOT match. Without it this asserts "the only
+    # order in the database was returned", which is true whether or not the
+    # search filter exists - mutation-testing caught exactly that.
+    other, _ = make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+    other.customer_email = "someone-else@example.com"
+    db_session.commit()
+
+    response = admin_client.get("/api/v1/admin/orders?q=researcher@ex")
+
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["customer_email"] == "Researcher@Example.COM"
+
+
+def test_search_and_status_narrow_together(admin_client, db_session):
+    """Both filters at once, or the tabs and the search box fight each other."""
+    order, _ = make_order_for_admin(db_session, status=OrderStatus.shipped)
+    # A second shipped order, so "status=shipped" alone would return two. Without
+    # it the status filter satisfies the assertion on its own and the search is
+    # never exercised.
+    make_order_for_admin(db_session, status=OrderStatus.shipped)
+    make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    hit = admin_client.get(f"/api/v1/admin/orders?status=shipped&q={order.order_number}")
+    miss = admin_client.get(f"/api/v1/admin/orders?status=delivered&q={order.order_number}")
+
+    assert hit.json()["total"] == 1
+    assert miss.json()["total"] == 0
+
+
+def test_an_absurd_page_size_is_refused_at_the_boundary(admin_client, db_session):
+    """limit is a query parameter, so it is caller-controlled. Unbounded, it is
+    a way to ask for every order in one request.
+
+    This is FastAPI's `le=` doing the work, not the service - the request never
+    reaches it. The service clamps as well, for callers that bypass the
+    endpoint; that is asserted separately below.
+    """
+    make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    response = admin_client.get("/api/v1/admin/orders?limit=100000")
+
+    assert response.status_code == 422
+
+
+def test_the_service_clamps_a_page_size_the_endpoint_would_have_rejected(
+    db_session, monkeypatch
+):
+    """Called directly, with no FastAPI validation in front of it.
+
+    The maximum is lowered for the test rather than creating two hundred orders
+    to exceed the real one. Asserting `len(orders) <= 200` with three orders in
+    the database passes whether or not the clamp exists - mutation-testing
+    caught that, twice.
+    """
+    from app.services import order_service
+
+    monkeypatch.setattr(order_service, "MAX_ORDER_PAGE_SIZE", 2)
+    for _ in range(3):
+        make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    orders, total = order_service.list_all_orders(db_session, limit=100_000)
+
+    assert total == 3, "the count is of every match, not of the page"
+    assert len(orders) == 2, "the page size was not clamped"
+
+
+def test_a_page_size_below_one_is_raised_to_one(db_session):
+    """limit=0 would otherwise emit LIMIT 0 and return nothing forever."""
+    from app.services.order_service import list_all_orders
+
+    make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    orders, total = list_all_orders(db_session, limit=0)
+
+    assert total == 1
+    assert len(orders) == 1
+
+
+def test_search_over_no_matches_is_an_empty_page_not_an_error(admin_client, db_session):
+    make_order_for_admin(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    response = admin_client.get("/api/v1/admin/orders?q=nothing-matches-this")
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "total": 0, "limit": 50, "offset": 0}

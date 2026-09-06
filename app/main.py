@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 
 import app.models  # noqa: F401 - registers ORM models on Base.metadata
 
@@ -24,6 +25,11 @@ async def lifespan(app: FastAPI):
     yield
 
 settings = get_settings()
+
+# Before anything else logs. uvicorn configures its own loggers and leaves the
+# root alone, so without this every logger.info in the application is discarded
+# and the failures email_service deliberately swallows leave no trace at all.
+configure_logging(settings.log_level)
 
 app = FastAPI(
     title=settings.app_name,

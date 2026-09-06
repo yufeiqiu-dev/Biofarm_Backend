@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
@@ -58,7 +59,11 @@ def make_order(db_session, user_id: str = "test-user-123", status: OrderStatus =
 
 # --- order_service tests ---
 
-def test_ship_order_deducts_stock(db_session):
+def test_confirming_and_shipping_leave_stock_alone(db_session):
+    """Neither step moves inventory; it was taken when the order was created.
+
+    Named for deduction until stock moved to creation, and it asserted 4 here.
+    """
     from app.services.order_service import confirm_order_admin, ship_order
 
     order, variant = make_order(db_session, stock=5)
@@ -69,7 +74,7 @@ def test_ship_order_deducts_stock(db_session):
     assert result is not None
     assert result.status == OrderStatus.shipped
     db_session.refresh(variant)
-    assert variant.stock == 4
+    assert variant.stock == 5
 
 
 def test_ship_order_wrong_status_raises(db_session):
@@ -240,3 +245,90 @@ def test_create_payment_intent_unauthenticated(client: TestClient):
         },
     })
     assert response.status_code in (401, 403)
+
+
+# --- where order mail is sent -------------------------------------------------
+#
+# The customer may nominate an address; blank falls back to the one on their
+# Cognito account. Safe to take their word for, because order mail is a
+# notification and never a credential: every order is scoped by user_id, and
+# nothing anywhere is reachable by knowing an email. A lab ordering against a
+# shared purchasing address could not say so otherwise.
+
+def _checkout(user_client, variant, **extra):
+    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()), \
+         patch("app.api.v1.endpoints.orders.calculate_tax", return_value=make_tax_mock(1500)):
+        return user_client.post("/api/v1/orders/payment-intent", json={
+            "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+            "shipping": {
+                "name": "Jane Smith",
+                "phone": "5551234567",
+                "address1": "123 Main St",
+                "city": "Springfield",
+                "state": "IL",
+                "zip": "62701",
+            },
+            **extra,
+        })
+
+
+def _session_for(db_session, pi_id: str):
+    from app.models.checkout_session import CheckoutSession
+    return db_session.scalar(
+        select(CheckoutSession).where(CheckoutSession.stripe_pi_id == pi_id)
+    )
+
+
+def test_checkout_sends_mail_to_the_nominated_address(user_client: TestClient, db_session):
+    _, variant = make_product_with_variant(db_session, "MAIL-1", stock=5)
+
+    response = _checkout(user_client, variant, contact_email="purchasing@lab.edu")
+
+    assert response.status_code == 201
+    session = _session_for(db_session, make_stripe_pi_mock().id)
+    assert session is not None
+    assert session.customer_email == "purchasing@lab.edu"
+
+
+def test_checkout_falls_back_to_the_account_address(user_client: TestClient, db_session):
+    """Blank means "use my account address" - the verified one from the id token.
+
+    This is what keeps that verification worth having: it is the fallback, and
+    the fallback is the common case.
+    """
+    _, variant = make_product_with_variant(db_session, "MAIL-2", stock=5)
+
+    response = _checkout(user_client, variant, contact_email="")
+
+    assert response.status_code == 201
+    session = _session_for(db_session, make_stripe_pi_mock().id)
+    # The identity user_client authenticates as, rather than merely "not the
+    # nominated one" - which would hold for an empty string too.
+    assert session.customer_email == "user@test.com"
+
+
+def test_checkout_omitting_the_field_entirely_is_fine(user_client: TestClient, db_session):
+    """An older client that does not send the field at all must still check out."""
+    _, variant = make_product_with_variant(db_session, "MAIL-3", stock=5)
+
+    assert _checkout(user_client, variant).status_code == 201
+
+
+def test_checkout_rejects_a_malformed_address(user_client: TestClient, db_session):
+    """Caught here rather than discovered when SES bounces it days later."""
+    _, variant = make_product_with_variant(db_session, "MAIL-4", stock=5)
+
+    assert _checkout(user_client, variant, contact_email="not-an-address").status_code == 422
+
+
+def test_the_nominated_address_survives_the_webhook(user_client: TestClient, db_session):
+    """It is stored on the checkout session, so it reaches the order Stripe creates."""
+    from app.services.order_service import create_order_from_checkout_session
+
+    _, variant = make_product_with_variant(db_session, "MAIL-5", stock=5)
+    _checkout(user_client, variant, contact_email="purchasing@lab.edu")
+
+    order = create_order_from_checkout_session(db_session, make_stripe_pi_mock().id)
+
+    assert order is not None
+    assert order.customer_email == "purchasing@lab.edu"

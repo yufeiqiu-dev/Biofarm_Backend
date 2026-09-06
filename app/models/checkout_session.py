@@ -18,5 +18,10 @@ class CheckoutSession(Base):
     customer_email: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
     tax_amount_cents: Mapped[int] = mapped_column(nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        # cleanup_stale_checkout_sessions sweeps by age, so this is the column
+        # it filters on - without an index that sweep scans the table.
+        index=True,
     )
