@@ -1,6 +1,9 @@
+import logging
+import re
 import uuid
 from typing import Optional
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -21,7 +24,10 @@ from app.services.order_service import (
     ship_order,
     update_tracking_number,
 )
+from app.services.cognito_service import get_account
 from app.services.stripe_service import cancel_payment_intent, capture_payment_intent, create_refund
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/orders", tags=["admin-orders"])
 
@@ -77,6 +83,42 @@ def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
     )
 
 
+# Only decides whether a Cognito lookup is worth attempting, so it is loose on
+# purpose - a false positive costs one lookup, which is then cached as a miss.
+#
+# It does not, and cannot, promise that a half-typed address never resolves:
+# "alice@lab.co" is both a real address and a prefix of "alice@lab.com". What
+# actually bounds the calls is the console's 300ms debounce and the negative
+# cache; the two-character minimum below just removes the noisiest case, since a
+# pause mid-TLD is where typing most often stops.
+_LOOKS_LIKE_EMAIL = re.compile(r"\A[^@\s]+@[^@\s]+\.[^@\s]{2,}\Z")
+
+
+def _sub_for_search(search: Optional[str]) -> Optional[str]:
+    """The account behind a searched-for email address, if there is one.
+
+    The point of the whole thing: `customer_email` holds where the customer
+    asked order mail to go, and support hears about it precisely when that was
+    wrong. Searching the address they actually have would otherwise match
+    nothing, and the admin would have to know to look up a sub by hand.
+
+    Never raises. A search must not fail because Cognito is unreachable - the
+    text matches are still worth returning, and an admin who gets an error
+    instead of a partial result has no way to tell the difference between
+    "no such customer" and "AWS is down".
+    """
+    if not search or not _LOOKS_LIKE_EMAIL.match(search.strip()):
+        return None
+
+    try:
+        account = get_account(search.strip())
+    except (ValueError, BotoCoreError, ClientError):
+        logger.warning("could not resolve %r to an account; searching text only", search)
+        return None
+
+    return account["sub"] if account else None
+
+
 @router.get("", response_model=AdminOrderPage)
 def list_orders(
     # Named status_filter because a parameter called `status` shadows the
@@ -87,7 +129,12 @@ def list_orders(
     search: Optional[str] = Query(
         default=None,
         alias="q",
-        description="Matches order number, customer email, shipping name, user id or order id.",
+        description=(
+            "Matches order number, customer email, shipping name, user id or "
+            "order id. An email is also resolved against Cognito, so a customer's "
+            "own address finds their orders even when they sent the confirmation "
+            "somewhere else."
+        ),
     ),
     limit: int = Query(default=DEFAULT_ORDER_PAGE_SIZE, ge=1, le=MAX_ORDER_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
@@ -104,7 +151,12 @@ def list_orders(
                 detail=f"Invalid status: {status_filter}",
             )
     orders, total = list_all_orders(
-        db, order_status, search=search, limit=limit, offset=offset
+        db,
+        order_status,
+        search=search,
+        also_user_id=_sub_for_search(search),
+        limit=limit,
+        offset=offset,
     )
     return AdminOrderPage(
         items=[_build_admin_order_out(o, db) for o in orders],

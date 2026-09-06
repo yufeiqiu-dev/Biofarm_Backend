@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.dependencies.auth import require_admin
 from app.schemas.account import AccountOut
-from app.services.cognito_service import get_account_by_sub
+from app.services.cognito_service import get_account
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,8 @@ router = APIRouter(prefix="/admin/users", tags=["admin-users"])
 
 
 @router.get("/{sub}", response_model=AccountOut)
-def get_account(sub: str, _=Depends(require_admin)):
-    """The Cognito account for an order's user_id.
+def resolve_account(sub: str, _=Depends(require_admin)):
+    """The Cognito account for an order's user_id, or for an email address.
 
     404 means the account is genuinely gone - deleted from the pool, with its
     orders outliving it, which is a normal thing for an order to do. 502 means
@@ -30,7 +30,7 @@ def get_account(sub: str, _=Depends(require_admin)):
     customer look deleted.
     """
     try:
-        account = get_account_by_sub(sub)
+        account = get_account(sub)
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
     except (BotoCoreError, ClientError) as error:

@@ -53,8 +53,9 @@ _cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 # AdminGetUser takes it as a parameter, so there is nothing left to inject into -
 # this now just refuses obvious junk rather than paying for a round trip to
 # discover it. Kept because it costs nothing and rejects no legitimate sub: real
-# ones are uuids, and the synthetic AUTH_BYPASS identity is "local-dev-user".
-_SAFE_SUB = re.compile(r"\A[A-Za-z0-9_.:@-]{1,128}\Z")
+# ones are uuids, an email is equally acceptable here, and the synthetic
+# AUTH_BYPASS identity is "local-dev-user".
+_SAFE_IDENTIFIER = re.compile(r"\A[A-Za-z0-9_.:@-]{1,128}\Z")
 
 # What AUTH_BYPASS hands out in place of a real identity. Nothing in Cognito
 # matches it, so resolving it would be a pointless API call that always fails -
@@ -67,22 +68,27 @@ def _attributes_of(user: dict[str, Any]) -> dict[str, str]:
     return {a["Name"]: a["Value"] for a in user.get("UserAttributes", [])}
 
 
-def get_account_by_sub(sub: str) -> Optional[dict[str, Any]]:
-    """The Cognito account for `sub`, or None when there is no such account.
+def get_account(identifier: str) -> Optional[dict[str, Any]]:
+    """The Cognito account for a sub or an email, or None if there is none.
+
+    Both work through the same call. `AdminGetUser`'s `Username` accepts the
+    account's sign-in alias as well as its username, and this pool signs in with
+    email - so resolving a support enquiry ("this customer says they never got a
+    confirmation") costs no permission beyond the one already granted.
 
     Raises ValueError for a sub that cannot be safely queried. Any AWS failure
     propagates - the endpoint decides what a lookup failure means, and silently
     returning None would present "Cognito is unreachable" as "this customer does
     not exist".
     """
-    if not _SAFE_SUB.match(sub):
-        raise ValueError("Not a well-formed user id")
+    if not _SAFE_IDENTIFIER.match(identifier):
+        raise ValueError("Not a well-formed user id or email")
 
     settings = get_settings()
 
-    if settings.auth_bypass and sub == _BYPASS_SUB:
+    if settings.auth_bypass and identifier == _BYPASS_SUB:
         return {
-            "sub": sub,
+            "sub": identifier,
             "username": _BYPASS_SUB,
             "email": "dev@example.com",
             "name": "Local development user",
@@ -92,7 +98,7 @@ def get_account_by_sub(sub: str) -> Optional[dict[str, Any]]:
             "synthetic": True,
         }
 
-    cached = _cache.get(sub)
+    cached = _cache.get(identifier)
     if cached and cached[0] > time.monotonic():
         return cached[1]
 
@@ -100,7 +106,7 @@ def get_account_by_sub(sub: str) -> Optional[dict[str, Any]]:
     try:
         user = client.admin_get_user(
             UserPoolId=settings.cognito_user_pool_id,
-            Username=sub,
+            Username=identifier,
         )
     except client.exceptions.UserNotFoundException:
         # Cached as a miss too. A deleted account is looked up every time one of
@@ -109,15 +115,15 @@ def get_account_by_sub(sub: str) -> Optional[dict[str, Any]]:
         #
         # Note this is also what a pool that did not accept a sub as the username
         # would raise, which is why that is worth confirming rather than assuming.
-        logger.info("no Cognito account for sub %s", sub)
-        _cache[sub] = (time.monotonic() + _CACHE_TTL_SECONDS, None)
+        logger.info("no Cognito account for %s", identifier)
+        _cache[identifier] = (time.monotonic() + _CACHE_TTL_SECONDS, None)
         return None
 
     attributes = _attributes_of(user)
     created = user.get("UserCreateDate")
 
     account = {
-        "sub": attributes.get("sub", sub),
+        "sub": attributes.get("sub", identifier),
         "username": user.get("Username", ""),
         "email": attributes.get("email", ""),
         "name": attributes.get("name") or attributes.get("given_name") or "",
@@ -127,7 +133,7 @@ def get_account_by_sub(sub: str) -> Optional[dict[str, Any]]:
         "synthetic": False,
     }
 
-    _cache[sub] = (time.monotonic() + _CACHE_TTL_SECONDS, account)
+    _cache[identifier] = (time.monotonic() + _CACHE_TTL_SECONDS, account)
     return account
 
 

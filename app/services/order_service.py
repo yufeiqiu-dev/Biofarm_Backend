@@ -454,6 +454,7 @@ def list_all_orders(
     db: Session,
     status: OrderStatus | None = None,
     search: str | None = None,
+    also_user_id: str | None = None,
     limit: int = DEFAULT_ORDER_PAGE_SIZE,
     offset: int = 0,
 ) -> tuple[list[Order], int]:
@@ -480,13 +481,28 @@ def list_all_orders(
         # The same fields the client filter covered, so the search box behaves
         # as it did. ilike keeps it case-insensitive on Postgres; SQLite treats
         # LIKE as case-insensitive for ASCII anyway, so the tests agree.
+        clauses = [
+            Order.order_number.ilike(term),
+            Order.customer_email.ilike(term),
+            Order.shipping_name.ilike(term),
+            Order.user_id.ilike(term),
+            cast(Order.id, String).ilike(term),
+        ]
+
+        # An account resolved from the search term by the endpoint. Passed in
+        # rather than looked up here so this stays a database function: the
+        # search is exercised by the suite without mocking AWS, and Cognito
+        # being unreachable degrades the search instead of breaking it.
+        #
+        # It matters because customer_email is where the customer asked mail to
+        # go, and the whole reason support gets involved is that it was wrong.
+        # Searching their real address would otherwise find nothing.
+        if also_user_id:
+            clauses.append(Order.user_id == also_user_id)
+
         filters.append(
             or_(
-                Order.order_number.ilike(term),
-                Order.customer_email.ilike(term),
-                Order.shipping_name.ilike(term),
-                Order.user_id.ilike(term),
-                cast(Order.id, String).ilike(term),
+                *clauses,
             )
         )
 
