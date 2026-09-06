@@ -18,13 +18,28 @@ holds the credential enumerate every account, while this reads only an account
 whose sub the caller already has. The difference is the customer list.
 
 It works because `AdminGetUser` takes a `Username` and this pool has
-`UsernameAttributes: ["email"]` with no alias attributes - the configuration in
-which that value "must be the sub of a local user". **Worth confirming against
-the pool before relying on it**: if a pool did not accept a sub there, the call
-would raise `UserNotFoundException`, which is indistinguishable from an account
-that has genuinely been deleted.
+`UsernameAttributes: ["email"]` with no alias attributes. Cognito then does not
+permit a chosen username at all - it generates a uuid, and that uuid *is* the
+sub - so this passes the real username rather than a lookup key.
 
-    aws cognito-idp admin-get-user --user-pool-id <pool> --username <a sub>
+**Verified against the pool on 2026-09-06**, because the failure would be quiet:
+a pool that did not accept the value raises `UserNotFoundException`, which is
+indistinguishable from an account that has genuinely been deleted. Four things
+were checked, and all hold:
+
+  - `Username` = the sub resolves the account
+  - `Username` = the email resolves the same account, which is what lets an
+    admin search by a customer's real address without any wider permission
+  - the response carries `UserAttributes` (`ListUsers` returns `Attributes`)
+  - a missing account raises `UserNotFoundException`
+
+Re-check with, for any account in the pool:
+
+    aws cognito-idp admin-get-user --user-pool-id <pool> --username <sub or email>
+
+One thing that check also showed: the pool collects only `email` and `sub`. It
+asks for no `name` at sign-up, so that field is empty for every real account
+today - handled below, and the console simply shows the address.
 """
 
 from __future__ import annotations

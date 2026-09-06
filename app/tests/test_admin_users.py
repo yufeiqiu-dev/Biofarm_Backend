@@ -263,3 +263,32 @@ def test_an_unknown_address_finds_nothing_rather_than_everything(
         response = admin_client.get("/api/v1/admin/orders?q=nobody@nowhere.com")
 
     assert response.json()["total"] == 0
+
+
+def test_an_account_with_no_name_resolves_fine(admin_client: TestClient):
+    """The shape real accounts actually have.
+
+    The pool asks for email at sign-up and nothing else, so `name` is absent
+    from every account in it - checked against the real pool, where the only
+    attributes present are email and sub. The fixture above is more generous
+    than reality, which is exactly how a missing-attribute crash reaches
+    production with the suite green.
+    """
+    bare = {
+        "Username": SUB,
+        "Enabled": True,
+        "UserStatus": "CONFIRMED",
+        "UserCreateDate": datetime(2026, 1, 4, tzinfo=timezone.utc),
+        "UserAttributes": [
+            {"Name": "sub", "Value": SUB},
+            {"Name": "email", "Value": "alice@lab.edu"},
+        ],
+    }
+
+    with patch("app.services.cognito_service.get_client", return_value=cognito_returning(bare)):
+        response = admin_client.get(f"/api/v1/admin/users/{SUB}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["email"] == "alice@lab.edu"
+    assert body["name"] == "", "a missing name must be empty, not absent or null"
