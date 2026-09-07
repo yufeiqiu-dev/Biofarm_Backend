@@ -306,3 +306,55 @@ def test_taking_stock_writes_nothing_when_any_variant_is_short(db_session):
 
     assert plenty.stock == 10, "a variant was decremented for a take that failed"
     assert short.stock == 0
+
+
+def test_a_customer_cancelling_their_own_order_returns_the_stock(
+    user_client, db_session
+):
+    """The customer-facing cancel must give stock back, like the admin one does.
+
+    This was correct until stock moved to creation: the endpoint only permits
+    pending and awaiting_fulfillment, and under the old rule neither held any
+    stock, so setting the status was the whole job. Now every order holds stock
+    from the moment it exists, and cancelling without returning it destroys
+    inventory permanently.
+    """
+    from unittest.mock import patch
+
+    _, variant = make_product_with_variant(db_session, "CUSTCANCEL-1", stock=5)
+    order = place(db_session, [CartItemIn(variant_id=variant.id, quantity=3)])
+    order.user_id = "test-user-123"
+    order.status = OrderStatus.awaiting_fulfillment
+    db_session.commit()
+
+    db_session.expire_all()
+    assert db_session.get(ProductVariant, variant.id).stock == 2, "creation should have taken 3"
+
+    with patch("app.api.v1.endpoints.orders.cancel_payment_intent"):
+        response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    db_session.expire_all()
+    assert db_session.get(ProductVariant, variant.id).stock == 5, (
+        "the customer cancelled and the stock was destroyed"
+    )
+
+
+def test_the_service_level_customer_cancel_returns_stock_too(db_session):
+    """cancel_order_by_customer reads like the customer path and is exported.
+
+    Only the tests reach it today, but the moment anything routes to it the same
+    inventory leak appears - so it must not be able to diverge from the endpoint.
+    """
+    from app.services.order_service import cancel_order_by_customer
+
+    _, variant = make_product_with_variant(db_session, "CUSTCANCEL-2", stock=4)
+    order = place(db_session, [CartItemIn(variant_id=variant.id, quantity=2)])
+    order.user_id = "test-user-123"
+    order.status = OrderStatus.awaiting_fulfillment
+    db_session.commit()
+
+    cancel_order_by_customer(db_session, order.id, "test-user-123")
+
+    db_session.expire_all()
+    assert db_session.get(ProductVariant, variant.id).stock == 4
