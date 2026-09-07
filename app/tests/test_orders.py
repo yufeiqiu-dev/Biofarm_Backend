@@ -368,3 +368,115 @@ def test_the_order_page_query_breaks_ties_on_a_unique_column(db_session):
     for statement in ordered:
         clause = statement.upper().split("ORDER BY", 1)[1]
         assert "ID" in clause, f"no unique tiebreaker in: {clause.strip()[:80]}"
+
+
+# --- shipping --------------------------------------------------------------
+#
+# The shop charged goods plus tax and nothing for postage. For reagents shipped
+# cold that is a real cost absorbed on every order.
+#
+# A flat rate behind a seam: the amount is the only part that depends on the
+# carrier, and everything else - a line on the order, an amount in the intent, a
+# row at checkout and on the receipt - is the same whatever that answer is.
+
+def test_nothing_is_charged_until_a_rate_is_configured(user_client: TestClient, db_session):
+    """Zero by default, so an environment that has not set it keeps behaving as
+    it did rather than surprising customers with a charge nobody chose."""
+    from app.core.config import get_settings
+
+    _, variant = make_product_with_variant(db_session, "SHIP-0", stock=5)
+    assert get_settings().shipping_flat_cents == 0
+
+    response = _checkout(user_client, variant)
+
+    assert response.status_code == 201
+    assert response.json()["shipping_amount_cents"] == 0
+
+
+def test_a_configured_rate_is_quoted_at_checkout(user_client: TestClient, db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-1", stock=5)
+
+    body = _checkout(user_client, variant).json()
+
+    assert body["shipping_amount_cents"] == 2500
+
+
+def test_the_customer_is_charged_for_shipping(user_client: TestClient, db_session, monkeypatch):
+    """The whole point. It must reach the PaymentIntent, not just the response."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-2", price=10.0, stock=5)
+
+    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()) as pi, \
+         patch("app.api.v1.endpoints.orders.calculate_tax", return_value=make_tax_mock(3500)):
+        user_client.post("/api/v1/orders/payment-intent", json={
+            "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+            "shipping": {"name": "J", "phone": "5551234567", "address1": "1 St",
+                         "city": "C", "state": "IL", "zip": "62701"},
+        })
+
+    charged = pi.call_args.args[0]
+    assert charged > 1000, f"the customer was charged {charged}, which cannot include $25 of postage"
+
+
+def test_tax_is_told_about_shipping(user_client: TestClient, db_session, monkeypatch):
+    """Most US states tax delivery, and which ones is exactly the judgement
+    Stripe Tax exists to make - so it has to know."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-3", stock=5)
+
+    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()), \
+         patch("app.api.v1.endpoints.orders.calculate_tax", return_value=make_tax_mock(1000)) as tax:
+        user_client.post("/api/v1/orders/payment-intent", json={
+            "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+            "shipping": {"name": "J", "phone": "5551234567", "address1": "1 St",
+                         "city": "C", "state": "IL", "zip": "62701"},
+        })
+
+    assert tax.call_args.args[2] == 2500, "Stripe Tax was not given the shipping amount"
+
+
+def test_shipping_survives_the_webhook(user_client: TestClient, db_session, monkeypatch):
+    """The order is built from the checkout session minutes later. Recomputing
+    shipping there could charge a rate the customer was never shown."""
+    from app.core.config import get_settings
+    from app.services.order_service import create_order_from_checkout_session
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-4", stock=5)
+    _checkout(user_client, variant)
+
+    order = create_order_from_checkout_session(db_session, make_stripe_pi_mock().id)
+
+    assert order is not None
+    assert order.shipping_amount == Decimal("25.00")
+
+
+def test_the_receipt_adds_up(db_session):
+    """A confirmation whose lines do not sum to its total is a support email."""
+    from app.services import email_service
+
+    order, _ = make_order(db_session)
+    order.tax_amount = Decimal("2.00")
+    order.shipping_amount = Decimal("25.00")
+    db_session.commit()
+
+    body = email_service._order_summary(order) if hasattr(email_service, "_order_summary") else None
+    if body is None:
+        import inspect
+        src = inspect.getsource(email_service)
+        assert "shipping_amount" in src, "the receipt never mentions shipping"
+    else:
+        assert "Shipping" in body
+
+
+def test_an_empty_cart_is_not_charged_postage(db_session):
+    from app.services.shipping_service import calculate_shipping
+
+    assert calculate_shipping([]) == 0

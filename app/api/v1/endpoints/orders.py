@@ -21,6 +21,7 @@ from app.services.order_service import (
     get_orders_for_user,
     save_checkout_session,
 )
+from app.services.shipping_service import calculate_shipping
 from app.services.stripe_service import calculate_tax, cancel_payment_intent, create_payment_intent
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -133,8 +134,12 @@ def initiate_checkout(
             "postal_code": payload.shipping.zip,
             "country": "US",
         }
+        # Quoted once, here, and carried everywhere after. Recomputing it later
+        # risks charging a rate the customer was never shown.
+        shipping_cents = calculate_shipping(payload.cart)
+
         try:
-            tax_result = calculate_tax(line_items_for_tax, shipping_address)
+            tax_result = calculate_tax(line_items_for_tax, shipping_address, shipping_cents)
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -165,6 +170,7 @@ def initiate_checkout(
                 shipping=payload.shipping,
                 stripe_pi_id=pi.id,
                 tax_amount=Decimal(tax_result.tax_amount_cents) / 100,
+                shipping_amount=Decimal(shipping_cents) / 100,
                 customer_email=customer_email,
                 card_brand="visa",
                 card_last4="4242",
@@ -176,6 +182,7 @@ def initiate_checkout(
                 order_id=order.id,
                 subtotal_cents=subtotal_cents,
                 tax_amount_cents=tax_result.tax_amount_cents,
+                shipping_amount_cents=shipping_cents,
             )
 
         save_checkout_session(
@@ -185,6 +192,7 @@ def initiate_checkout(
             cart=payload.cart,
             shipping=payload.shipping,
             tax_amount_cents=tax_result.tax_amount_cents,
+            shipping_amount_cents=shipping_cents,
             customer_email=customer_email,
         )
     except ValueError as e:
@@ -194,6 +202,7 @@ def initiate_checkout(
         client_secret=pi.client_secret,
         subtotal_cents=subtotal_cents,
         tax_amount_cents=tax_result.tax_amount_cents,
+        shipping_amount_cents=shipping_cents,
     )
 
 

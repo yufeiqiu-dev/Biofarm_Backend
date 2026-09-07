@@ -24,6 +24,19 @@ class Settings(BaseSettings):
     # Override in production with the deployed frontend origin
     cors_origins: list[str] = ["http://localhost:5174"]
 
+    shipping_flat_cents: int = 0
+    """What shipping costs the customer, in cents.
+
+    Zero by default, which is what the shop charged before this existed - so an
+    environment that has not set it keeps behaving as it did rather than
+    surprising customers with a charge nobody chose.
+
+    A flat rate on purpose. Live carrier rates need a weight and box dimensions
+    on every variant, which is data entry rather than code, and the amount is
+    the only part of shipping that depends on the carrier - see
+    shipping_service for the seam a real rate would slot into.
+    """
+
     business_timezone: str = "America/New_York"
     """The zone the admin dashboard's date windows are computed in.
 

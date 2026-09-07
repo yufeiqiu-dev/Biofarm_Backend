@@ -119,6 +119,7 @@ def create_order(
     shipping: ShippingIn,
     stripe_pi_id: str,
     tax_amount: Decimal = Decimal("0"),
+    shipping_amount: Decimal = Decimal("0"),
     customer_email: str = "",
     card_brand: str = "",
     card_last4: str = "",
@@ -171,6 +172,7 @@ def create_order(
             notes=shipping.notes,
             total_amount=total,
             tax_amount=tax_amount,
+            shipping_amount=shipping_amount,
             items=[OrderItem(**values) for values in item_values],
         )
 
@@ -223,7 +225,14 @@ def save_checkout_session(
     user_id: str,
     cart: list[CartItemIn],
     shipping: ShippingIn,
+    # Keyword-only from here. Adding shipping_amount_cents in the middle of this
+    # list silently rebound a positional caller's email string to a cents
+    # argument - no type error, just an order stored with an empty address and a
+    # nonsense shipping charge. A bare * makes that impossible for the next
+    # field anyone adds.
+    *,
     tax_amount_cents: int = 0,
+    shipping_amount_cents: int = 0,
     customer_email: str = "",
 ) -> CheckoutSession:
     """Record the cart against a PaymentIntent, replacing any existing record.
@@ -259,6 +268,7 @@ def save_checkout_session(
     session.cart_json = cart_json
     session.shipping_json = shipping.model_dump_json()
     session.tax_amount_cents = tax_amount_cents
+    session.shipping_amount_cents = shipping_amount_cents
 
     db.commit()
     db.refresh(session)
@@ -280,8 +290,9 @@ def create_order_from_checkout_session(
     cart = [CartItemIn(variant_id=item["variant_id"], quantity=item["quantity"]) for item in json.loads(session.cart_json)]
     shipping = ShippingIn.model_validate_json(session.shipping_json)
     tax_amount = Decimal(session.tax_amount_cents) / 100
+    shipping_amount = Decimal(session.shipping_amount_cents) / 100
 
-    order = create_order(db, user_id=session.user_id, cart=cart, shipping=shipping, stripe_pi_id=stripe_pi_id, tax_amount=tax_amount, customer_email=session.customer_email, card_brand=card_brand, card_last4=card_last4)
+    order = create_order(db, user_id=session.user_id, cart=cart, shipping=shipping, stripe_pi_id=stripe_pi_id, tax_amount=tax_amount, shipping_amount=shipping_amount, customer_email=session.customer_email, card_brand=card_brand, card_last4=card_last4)
     order.status = OrderStatus.awaiting_fulfillment
     db.delete(session)
     db.commit()

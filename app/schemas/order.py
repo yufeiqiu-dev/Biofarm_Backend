@@ -93,6 +93,7 @@ class OrderOut(BaseModel):
     status: OrderStatus
     total_amount: Money
     tax_amount: Money = Decimal("0")
+    shipping_amount: Money = Decimal("0")
     card_brand: str = ""
     card_last4: str = ""
     shipping_name: str
@@ -121,6 +122,7 @@ class PaymentIntentResponse(BaseModel):
     order_id: Optional[uuid.UUID] = None  # only set in bypass mode
     subtotal_cents: int = 0
     tax_amount_cents: int = 0
+    shipping_amount_cents: int = 0
 
 
 class AdminOrderPage(BaseModel):

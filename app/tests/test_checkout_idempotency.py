@@ -187,8 +187,8 @@ def test_a_resubmitted_checkout_stores_the_latest_details(db_session):
     first = ShippingIn(**{**SHIPPING, "address1": "1 Wrong St"})
     corrected = ShippingIn(**{**SHIPPING, "address1": "2 Right Ave"})
 
-    save_checkout_session(db_session, "pi_same", "u", cart, first, 88, "a@example.com")
-    session = save_checkout_session(db_session, "pi_same", "u", cart, corrected, 99, "b@example.com")
+    save_checkout_session(db_session, "pi_same", "u", cart, first, tax_amount_cents=88, customer_email="a@example.com")
+    session = save_checkout_session(db_session, "pi_same", "u", cart, corrected, tax_amount_cents=99, customer_email="b@example.com")
 
     assert "2 Right Ave" in session.shipping_json
     assert session.tax_amount_cents == 99

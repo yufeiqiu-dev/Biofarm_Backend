@@ -55,19 +55,33 @@ def create_payment_intent(
     )
 
 
-def calculate_tax(line_items: list[dict], address: dict) -> TaxResult:
+def calculate_tax(line_items: list[dict], address: dict, shipping_cents: int = 0) -> TaxResult:
     """Calculate tax via Stripe Tax. line_items: [{amount (cents), reference, tax_code}].
-    In bypass mode, mocks 8.75% flat rate."""
+    In bypass mode, mocks 8.75% flat rate.
+
+    Shipping is passed to Stripe rather than added afterwards because most US
+    states tax delivery charges, and which ones is exactly the judgement Stripe
+    Tax exists to make. The returned total therefore already includes shipping
+    and any tax on it - it is what the customer is charged.
+    """
     settings = get_settings()
     subtotal = sum(item["amount"] for item in line_items)
     if settings.stripe_bypass:
-        tax = round(subtotal * 0.0875)
-        return TaxResult(tax_amount_cents=tax, total_cents=subtotal + tax)
+        # Taxed on goods plus shipping, matching the states that do so - the
+        # bypass path must not disagree with the real one about the total.
+        tax = round((subtotal + shipping_cents) * 0.0875)
+        return TaxResult(
+            tax_amount_cents=tax, total_cents=subtotal + shipping_cents + tax
+        )
     s = _get_stripe()
+    kwargs = {}
+    if shipping_cents:
+        kwargs["shipping_cost"] = {"amount": shipping_cents}
     calc = s.tax.Calculation.create(
         currency="usd",
         line_items=line_items,
         customer_details={"address": address, "address_source": "shipping"},
+        **kwargs,
     )
     return TaxResult(
         tax_amount_cents=calc.tax_amount_exclusive,

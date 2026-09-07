@@ -34,6 +34,7 @@ class Order(Base):
         # negative order.
         CheckConstraint("total_amount >= 0", name="ck_orders_total_not_negative"),
         CheckConstraint("tax_amount >= 0", name="ck_orders_tax_not_negative"),
+        CheckConstraint("shipping_amount >= 0", name="ck_orders_shipping_not_negative"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -64,6 +65,19 @@ class Order(Base):
     tracking_number: Mapped[str | None] = mapped_column(String(255), nullable=True)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default="0.00")
+    # What the customer paid to have it sent. Stored rather than recomputed: the
+    # rate can change, and an old order must still add up to what was charged.
+    shipping_amount: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2),
+        nullable=False,
+        # server_default fills existing rows and any INSERT that omits the
+        # column; `default` supplies the value at flush time. Neither populates
+        # the *attribute* of an Order that has not been flushed - it reads None
+        # until then, which is why email_service treats a missing amount as
+        # zero rather than trusting nullable=False.
+        default=Decimal("0.00"),
+        server_default="0.00",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
