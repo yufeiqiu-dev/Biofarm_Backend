@@ -292,3 +292,31 @@ def test_an_account_with_no_name_resolves_fine(admin_client: TestClient):
     body = response.json()
     assert body["email"] == "alice@lab.edu"
     assert body["name"] == "", "a missing name must be empty, not absent or null"
+
+
+def test_a_plus_addressed_customer_can_be_found(admin_client: TestClient):
+    """alice+orders@lab.edu is an ordinary address, and this is the feature that
+    has to find those people.
+
+    It passed the endpoint's email check, failed the identifier pattern, and the
+    ValueError was swallowed into a text-only search - so the customer whose
+    address is least guessable was the one who could never be looked up by it.
+    """
+    plus = "alice+orders@lab.edu"
+    client = cognito_returning(a_cognito_user(email=plus))
+    with patch("app.services.cognito_service.get_client", return_value=client):
+        response = admin_client.get(f"/api/v1/admin/users/{plus}")
+
+    assert response.status_code == 200, response.json()
+    assert client.admin_get_user.call_args.kwargs["Username"] == plus
+
+
+def test_the_cache_does_not_grow_without_bound(admin_client: TestClient):
+    """Its keys are whatever an admin typed that looked like an address, so an
+    unbounded dict in a long-lived process never stops growing."""
+    client = cognito_returning(None)
+    with patch("app.services.cognito_service.get_client", return_value=client):
+        for i in range(cognito_service._CACHE_MAX_ENTRIES + 50):
+            admin_client.get(f"/api/v1/admin/users/probe{i}@lab.edu")
+
+    assert len(cognito_service._cache) <= cognito_service._CACHE_MAX_ENTRIES

@@ -61,6 +61,13 @@ _CACHE_TTL_SECONDS = 300
 
 _cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 
+# Bounded because the keys are not a closed set: _sub_for_search feeds this
+# whatever an admin typed that looked like an address, including the partials a
+# debounce still lets through. Unbounded, a long-lived App Runner process
+# accumulates one entry per distinct string ever searched and never releases
+# them.
+_CACHE_MAX_ENTRIES = 512
+
 # Validated because it arrives from a URL path and is sent to AWS.
 #
 # This mattered more under the ListUsers version, where the sub was interpolated
@@ -70,7 +77,13 @@ _cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 # discover it. Kept because it costs nothing and rejects no legitimate sub: real
 # ones are uuids, an email is equally acceptable here, and the synthetic
 # AUTH_BYPASS identity is "local-dev-user".
-_SAFE_IDENTIFIER = re.compile(r"\A[A-Za-z0-9_.:@-]{1,128}\Z")
+#
+# `+` and `%` are in the set because plus-addressing is ordinary and this is the
+# feature that has to find those people: alice+orders@lab.edu passed the
+# endpoint's email check, failed here, and the failure was swallowed into a
+# text-only search - so the one customer whose address is hardest to guess at
+# was the one who could never be found by it.
+_SAFE_IDENTIFIER = re.compile(r"\A[A-Za-z0-9_.%+:@-]{1,128}\Z")
 
 # What AUTH_BYPASS hands out in place of a real identity. Nothing in Cognito
 # matches it, so resolving it would be a pointless API call that always fails -
@@ -131,7 +144,7 @@ def get_account(identifier: str) -> Optional[dict[str, Any]]:
         # Note this is also what a pool that did not accept a sub as the username
         # would raise, which is why that is worth confirming rather than assuming.
         logger.info("no Cognito account for %s", identifier)
-        _cache[identifier] = (time.monotonic() + _CACHE_TTL_SECONDS, None)
+        _remember(identifier, None)
         return None
 
     attributes = _attributes_of(user)
@@ -148,8 +161,23 @@ def get_account(identifier: str) -> Optional[dict[str, Any]]:
         "synthetic": False,
     }
 
-    _cache[identifier] = (time.monotonic() + _CACHE_TTL_SECONDS, account)
+    _remember(identifier, account)
     return account
+
+
+def _remember(key: str, value: Optional[dict[str, Any]]) -> None:
+    """Cache an answer, dropping what has expired and capping what has not."""
+    now = time.monotonic()
+
+    for stale in [k for k, (expires, _) in _cache.items() if expires <= now]:
+        del _cache[stale]
+
+    # Still full of live entries: evict whichever expires soonest, which is the
+    # least recently written.
+    if len(_cache) >= _CACHE_MAX_ENTRIES:
+        del _cache[min(_cache, key=lambda k: _cache[k][0])]
+
+    _cache[key] = (now + _CACHE_TTL_SECONDS, value)
 
 
 def clear_cache() -> None:

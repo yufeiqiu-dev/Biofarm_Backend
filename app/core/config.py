@@ -24,6 +24,17 @@ class Settings(BaseSettings):
     # Override in production with the deployed frontend origin
     cors_origins: list[str] = ["http://localhost:5174"]
 
+    business_timezone: str = "America/New_York"
+    """The zone the admin dashboard's date windows are computed in.
+
+    created_at is stored in UTC, where "today" rolls over in the early evening
+    in US zones - an order placed at 8pm would land in tomorrow's figures and
+    the dashboard would disagree with the admin's own sense of the day.
+
+    One fixed zone rather than the viewer's: the same number should appear on a
+    laptop, a phone, and from a hotel in another country.
+    """
+
     # Set to True in local dev to skip Cognito verification
     auth_bypass: bool = False
 

@@ -14,6 +14,7 @@ from app.models.product_variant import ProductVariant
 from app.models.order import OrderStatus
 from app.schemas.order import CreatePaymentIntentRequest, OrderOut, PaymentIntentResponse
 from app.services.order_service import (
+    cancel_order_by_customer,
     create_order,
     get_order_by_id,
     get_order_by_payment_intent,
@@ -250,7 +251,12 @@ def cancel_my_order(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe operation failed: {e}")
 
-    order.status = OrderStatus.cancelled
-    db.commit()
-    db.refresh(order)
-    return order
+    # Through the service rather than setting the status here. Cancelling now
+    # means returning the order's stock as well as marking it, and this endpoint
+    # used to do only the marking - so a customer cancelling their own order
+    # destroyed the inventory it was holding, while the admin doing the same
+    # thing returned it.
+    try:
+        return cancel_order_by_customer(db, order_id, current_user["sub"])
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

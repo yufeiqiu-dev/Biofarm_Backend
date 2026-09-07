@@ -24,6 +24,20 @@ def _jwks_client() -> PyJWKClient:
     return PyJWKClient(jwks_url, cache_keys=True, timeout=JWKS_TIMEOUT_SECONDS)
 
 
+# Tolerance for the clock difference between this host and Cognito.
+#
+# PyJWT rejects a token whose `iat` or `nbf` is in the future, so a backend whose
+# clock trails Cognito's by even a second fails *every* freshly issued token with
+# "The token is not yet valid" - which reads as a total authentication outage
+# rather than as a clock problem. Observed here: three seconds behind AWS, which
+# was enough.
+#
+# Thirty seconds is the usual allowance. It does not weaken expiry meaningfully -
+# a token stays valid half a minute longer than its `exp` - and it removes a
+# failure whose cause is invisible from the error.
+CLOCK_SKEW_LEEWAY = 30
+
+
 def _verify_access_token(token: str) -> dict:
     """Validate a Cognito access token and return its claims.
 
@@ -43,6 +57,7 @@ def _verify_access_token(token: str) -> dict:
             # client it was issued to lives in `client_id`, checked explicitly
             # below. Leaving audience verification on would reject every token.
             options={"verify_aud": False},
+            leeway=CLOCK_SKEW_LEEWAY,
         )
     except jwt.ExpiredSignatureError:
         raise HTTPException(
@@ -121,6 +136,7 @@ def verify_id_token(token: str) -> dict | None:
             algorithms=["RS256"],
             audience=client_id or None,
             options={"verify_aud": bool(client_id)},
+            leeway=CLOCK_SKEW_LEEWAY,
         )
     except jwt.InvalidTokenError:
         return None
