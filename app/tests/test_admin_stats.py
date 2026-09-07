@@ -239,3 +239,137 @@ def test_only_an_admin_sees_the_dashboard(client: TestClient):
 
 def test_a_signed_in_customer_cannot_see_it(user_client: TestClient):
     assert user_client.get("/api/v1/admin/stats").status_code in (401, 403)
+
+
+# --- the growth chart's data -------------------------------------------------
+
+def test_the_series_covers_every_day_including_the_empty_ones(
+    admin_client: TestClient, db_session
+):
+    """A chart drawn from only the days that had orders compresses time and
+    makes a quiet fortnight look like steady trade."""
+    make_order(db_session)
+
+    daily = admin_client.get("/api/v1/admin/stats").json()["daily"]
+
+    assert len(daily) == 30, f"expected 30 days, got {len(daily)}"
+    assert sum(1 for d in daily if d["orders"] == 0) >= 28
+
+
+def test_the_running_total_only_ever_climbs(admin_client: TestClient, db_session):
+    for _ in range(3):
+        make_order(db_session)
+
+    daily = admin_client.get("/api/v1/admin/stats").json()["daily"]
+
+    values = [d["cumulative"] for d in daily]
+    assert values == sorted(values), "the growth line went backwards"
+    assert values[-1] == 3
+
+
+def test_the_curve_starts_where_the_business_is_not_at_zero(
+    admin_client: TestClient, db_session
+):
+    """The point of a growth line is where the shop has got to. One that
+    restarts at zero every month shows nothing."""
+    old, _ = make_order(db_session)
+    old.created_at = datetime.now(tz=timezone.utc) - timedelta(days=90)
+    make_order(db_session)  # inside the window
+    db_session.commit()
+
+    daily = admin_client.get("/api/v1/admin/stats").json()["daily"]
+
+    assert daily[0]["cumulative"] >= 1, "the 90-day-old order was forgotten"
+    assert daily[-1]["cumulative"] == 2
+
+
+def test_a_cancelled_order_is_absent_from_the_curve(admin_client: TestClient, db_session):
+    make_order(db_session, status=OrderStatus.cancelled)
+
+    daily = admin_client.get("/api/v1/admin/stats").json()["daily"]
+
+    assert daily[-1]["cumulative"] == 0
+
+
+def test_days_are_bucketed_in_the_business_zone(admin_client: TestClient, db_session):
+    """An order at 9pm New York is already tomorrow in UTC. Bucketed naively it
+    lands on the wrong bar, and by one day every evening."""
+    zone = ZoneInfo("America/New_York")
+    order, _ = make_order(db_session)
+    local_evening = datetime.now(tz=zone).replace(hour=21, minute=0, second=0, microsecond=0)
+    order.created_at = local_evening.astimezone(timezone.utc)
+    db_session.commit()
+
+    daily = admin_client.get("/api/v1/admin/stats").json()["daily"]
+    expected = local_evening.date().isoformat()
+
+    landed = [d["date"] for d in daily if d["orders"] > 0]
+    assert landed == [expected], f"the evening order landed on {landed}, wanted {expected}"
+
+
+# --- what the queue is worth --------------------------------------------------
+
+def test_the_queue_is_priced_so_an_admin_can_judge_the_afternoon(
+    admin_client: TestClient, db_session
+):
+    make_order(db_session, status=OrderStatus.awaiting_fulfillment)  # 10.00
+    make_order(db_session, status=OrderStatus.confirmed)             # 10.00
+    make_order(db_session, status=OrderStatus.shipped)               # already gone
+
+    queue = admin_client.get("/api/v1/admin/stats").json()["queue"]
+
+    assert queue["queue_value"] == 20.0, "shipped work is not still waiting"
+
+
+def test_the_queue_value_excludes_tax(admin_client: TestClient, db_session):
+    """Sales tax is not the shop's, and this is not a payout figure - Stripe is
+    authoritative for money."""
+    order, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+    order.tax_amount = Decimal("99.00")
+    db_session.commit()
+
+    queue = admin_client.get("/api/v1/admin/stats").json()["queue"]
+
+    assert queue["queue_value"] == 10.0
+
+
+def test_an_empty_queue_is_worth_nothing(admin_client: TestClient, db_session):
+    assert admin_client.get("/api/v1/admin/stats").json()["queue"]["queue_value"] == 0
+
+
+def test_the_queue_value_is_a_json_number_not_a_string(admin_client: TestClient, db_session):
+    """Money crosses the API as a number. Bare Decimal serialises as a string and
+    the frontend's type says number, which is the rule the Money alias exists
+    to enforce."""
+    import json as _json
+
+    make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+
+    raw = _json.loads(admin_client.get("/api/v1/admin/stats").text)
+    assert isinstance(raw["queue"]["queue_value"], (int, float)), raw["queue"]["queue_value"]
+
+
+def test_the_reported_timezone_is_the_one_actually_used(admin_client: TestClient, monkeypatch):
+    """A bad setting falls back to UTC for bucketing. Reporting the raw setting
+    would have the footer claim a zone the bars are not in."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "business_timezone", "America/New_Yrok", raising=False)
+
+    body = admin_client.get("/api/v1/admin/stats").json()
+
+    assert body["timezone"] == "UTC", "the label named a zone the data is not bucketed in"
+
+
+def test_an_order_dated_tomorrow_does_not_vanish_from_the_total(
+    admin_client: TestClient, db_session
+):
+    """It used to be counted into the buckets and then dropped by the loop, so
+    the curve's end silently disagreed with the all-time tile above it."""
+    order, _ = make_order(db_session)
+    order.created_at = datetime.now(tz=timezone.utc) + timedelta(days=2)
+    db_session.commit()
+
+    body = admin_client.get("/api/v1/admin/stats").json()
+
+    assert body["daily"][-1]["cumulative"] == body["volume"]["all_time"]

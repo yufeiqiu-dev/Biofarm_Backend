@@ -1,6 +1,10 @@
 from typing import Optional
 
+from decimal import Decimal
+
 from pydantic import BaseModel
+
+from app.schemas.numeric import Money
 
 
 class QueueOut(BaseModel):
@@ -12,6 +16,14 @@ class QueueOut(BaseModel):
     # None when nothing is waiting. The age matters more than the count: three
     # orders to confirm is a normal morning, one sitting four days is not.
     oldest_awaiting_hours: Optional[float] = None
+    # Everything unshipped, priced pre-tax: awaiting_fulfillment and confirmed
+    # together. Named for the queue rather than for "awaiting" because the two
+    # fields above mean awaiting_fulfillment alone - an admin with 3 to confirm
+    # and 40 to ship would otherwise read this as the value of the 3.
+    #
+    # Money, not float: the alias CLAUDE.md requires for a decimal crossing the
+    # API. It still serialises as a JSON number.
+    queue_value: Money = Decimal("0")
 
 
 class VolumeOut(BaseModel):
@@ -53,10 +65,19 @@ class CatalogueOut(BaseModel):
     invisible_products: list[InvisibleProductOut]
 
 
+class DailyPointOut(BaseModel):
+    date: str
+    orders: int
+    # Counted from the shop's first order, not the window's start: a growth
+    # curve that restarts every month shows nothing.
+    cumulative: int
+
+
 class DashboardStatsOut(BaseModel):
     timezone: str
     generated_at: str
     queue: QueueOut
     volume: VolumeOut
+    daily: list[DailyPointOut]
     top_products: list[TopProductOut]
     catalogue: CatalogueOut

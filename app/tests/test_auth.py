@@ -350,3 +350,47 @@ def test_an_id_token_from_another_pool_is_rejected():
 def test_a_malformed_token_returns_none_rather_than_raising():
     """Checkout must not fail because the email could not be established."""
     assert _verify("not-a-jwt-at-all") is None
+
+
+# --- clock skew ---------------------------------------------------------------
+#
+# PyJWT rejects a token whose iat or nbf is in the future. A backend whose clock
+# trails Cognito's by even a second therefore fails every freshly issued token
+# with "The token is not yet valid", which reads as a total authentication
+# outage rather than as a clock problem. Measured here: three seconds behind AWS,
+# which was enough to lock the admin console out entirely.
+
+def test_a_token_issued_a_few_seconds_ahead_is_accepted(client: TestClient):
+    """The backend's clock trailing Cognito's must not 401 every request."""
+    ahead = int(time.time()) + 5
+    token = _make_token(iat=ahead, nbf=ahead)
+
+    with patch("app.dependencies.auth._jwks_client", return_value=_jwks_mock()), \
+         patch("app.dependencies.auth.get_settings", return_value=_settings_mock()):
+        response = client.get("/api/v1/admin/tags", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200, response.json()
+
+
+def test_a_token_issued_far_in_the_future_is_still_rejected(client: TestClient):
+    """The allowance is for clock drift, not for a forged timestamp."""
+    far = int(time.time()) + 3600
+    token = _make_token(iat=far, nbf=far)
+
+    with patch("app.dependencies.auth._jwks_client", return_value=_jwks_mock()), \
+         patch("app.dependencies.auth.get_settings", return_value=_settings_mock()):
+        response = client.get("/api/v1/admin/tags", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 401
+
+
+def test_an_expired_token_is_not_saved_by_the_allowance(client: TestClient):
+    """Thirty seconds of grace past exp is the cost; an hour is not."""
+    long_gone = int(time.time()) - 7200
+    token = _make_token(iat=long_gone, exp=long_gone + 60)
+
+    with patch("app.dependencies.auth._jwks_client", return_value=_jwks_mock()), \
+         patch("app.dependencies.auth.get_settings", return_value=_settings_mock()):
+        response = client.get("/api/v1/admin/tags", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 401

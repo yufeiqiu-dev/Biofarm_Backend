@@ -14,6 +14,7 @@ queries stay legible.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -116,6 +117,95 @@ def _queue(db: Session) -> dict[str, Any]:
         "in_transit": counts.get(OrderStatus.shipped, 0),
         "oldest_awaiting_hours": oldest_age_hours,
     }
+
+
+def _daily_series(db: Session, since: datetime, zone: ZoneInfo) -> list[dict[str, Any]]:
+    """Orders per local day for the window, with a running total.
+
+    The cumulative figure counts from the shop's first order, not from the start
+    of the window - the point of it is the growth curve, and one that restarts
+    every month shows nothing.
+
+    Bucketed in Python rather than in SQL. Grouping by *local* date needs a
+    timezone conversion inside the query, and the syntax for that is not portable
+    between the SQLite the suite runs on and the Postgres the server uses. Only
+    one indexed column is fetched, and only for the window, so even a busy shop
+    is a few thousand timestamps.
+    """
+    today_local = datetime.now(tz=timezone.utc).astimezone(zone).date()
+
+    rows = db.scalars(
+        select(Order.created_at)
+        .where(Order.status.in_(LIVE_STATUSES), Order.created_at >= since)
+        .order_by(Order.created_at)
+    ).all()
+
+    counts: dict[str, int] = {}
+    for created in rows:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        # Folded into today rather than dropped. The loop below stops at today,
+        # so a bucket beyond it would be built and discarded - and the curve's
+        # end would silently disagree with the all-time tile rendered directly
+        # above the chart. Excluding such an order from the query instead leaves
+        # it in neither the buckets nor the pre-window total, which is the same
+        # disagreement moved. Reachable through clock skew between instances, or
+        # an import that dates an order forward.
+        local_date = min(created.astimezone(zone).date(), today_local)
+        key = local_date.isoformat()
+        counts[key] = counts.get(key, 0) + 1
+
+    # Everything before the window, so the line starts where the business
+    # actually is rather than at zero.
+    running = (
+        db.scalar(
+            select(func.count())
+            .select_from(Order)
+            .where(Order.status.in_(LIVE_STATUSES), Order.created_at < since)
+        )
+        or 0
+    )
+
+    first_day = since.astimezone(zone).date()
+    today = today_local
+
+    series: list[dict[str, Any]] = []
+    day = first_day
+    while day <= today:
+        orders = counts.get(day.isoformat(), 0)
+        running += orders
+        series.append({"date": day.isoformat(), "orders": orders, "cumulative": running})
+        day += timedelta(days=1)
+
+    return series
+
+
+def _queue_value(db: Session) -> Decimal:
+    """What the unshipped queue is worth, pre-tax.
+
+    Named for the queue, not for "awaiting", because it sums awaiting_fulfillment
+    *and* confirmed - everything not yet shipped. Sitting in QueueOut beside
+    `to_confirm` and `oldest_awaiting_hours`, both of which mean
+    awaiting_fulfillment alone, a name like `awaiting_value` reads as the value
+    of that one tile: an admin with 3 to confirm and 40 to ship would take it for
+    the 3.
+
+    The to-do list priced, so an admin can tell an afternoon from ten minutes.
+    Deliberately not called revenue and deliberately not a payout figure: Stripe
+    is authoritative for money, and anything computed here drifts from it on
+    fees, refunds and disputes. Sales tax is excluded because it is not the
+    shop's.
+
+    Returns Decimal, not float: CLAUDE.md requires the Money alias for any
+    decimal crossing the API, and this was the one place a Numeric(10, 2) column
+    reached it as a float.
+    """
+    total = db.scalar(
+        select(func.coalesce(func.sum(Order.total_amount), 0)).where(
+            Order.status.in_((OrderStatus.awaiting_fulfillment, OrderStatus.confirmed))
+        )
+    )
+    return Decimal(total or 0)
 
 
 def _volume(db: Session, starts: dict[str, datetime]) -> dict[str, int]:
@@ -235,11 +325,19 @@ def get_dashboard_stats(db: Session) -> dict[str, Any]:
     """Everything the dashboard renders, in one response."""
     starts = window_starts()
 
+    queue = _queue(db)
+    queue["queue_value"] = _queue_value(db)
+
     return {
-        "timezone": get_settings().business_timezone,
+        # The zone actually resolved, not the setting. _business_zone falls back
+        # to UTC on a bad value, and reporting the raw setting would have the
+        # footer claim "Dates in America/New_Yrok" while every bar was bucketed
+        # in UTC - the label asserting exactly what is not true.
+        "timezone": str(_business_zone()),
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-        "queue": _queue(db),
+        "queue": queue,
         "volume": _volume(db, starts),
+        "daily": _daily_series(db, starts["last_30_days"], _business_zone()),
         "top_products": _top_products(db, starts["last_30_days"]),
         "catalogue": _catalogue(db),
     }
