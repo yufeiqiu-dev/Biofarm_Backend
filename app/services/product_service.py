@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 
 from sqlalchemy import or_, select
@@ -9,6 +10,8 @@ from app.models.product_variant import ProductVariant
 from app.models.tag import Tag
 from app.schemas.product import ProductCreate, ProductUpdate
 from app.services.s3_service import delete_s3_objects_by_urls
+
+logger = logging.getLogger(__name__)
 
 
 def _base_query():
@@ -128,7 +131,11 @@ def update_product(db: Session, product_id: UUID, payload: ProductUpdate) -> Pro
                 db_variant.size_value = variant_payload.size_value
                 db_variant.size_unit = variant_payload.size_unit
                 db_variant.price = variant_payload.price
-                db_variant.stock = variant_payload.stock
+                # Not stock. The schema rejects it on an existing variant, and
+                # this is the write that made that necessary: the payload is a
+                # whole-product form read before the admin started typing, so
+                # assigning it here overwrote every sale made in between.
+                # adjust_variant_stock applies a change under a row lock instead.
 
                 kept_variant_ids.add(db_variant.id)
 
@@ -162,3 +169,68 @@ def delete_product(db: Session, product_id: UUID) -> bool:
             pass  # S3 cleanup is best-effort; product is already deleted from DB
 
     return True
+
+
+class VariantNotFound(ValueError):
+    """The variant does not exist, or does not belong to the given product.
+
+    A type rather than a message, because the endpoint has to tell 404 from 400
+    and was doing it by comparing the string. Rewording the error - fixing a
+    typo, adding the id - would silently have turned a genuine 404 into a 400
+    with nothing but one test standing in the way.
+    """
+
+
+def adjust_variant_stock(
+    db: Session,
+    product_id: UUID,
+    variant_id: UUID,
+    delta: int,
+    reason: str | None = None,
+) -> ProductVariant:
+    """Apply a signed change to a variant's stock under a row lock.
+
+    The lock is the point, and it is not about two admins - there is one. It is
+    about the admin and the customers: `stock = stock + delta` computed inside a
+    held row lock cannot lose a sale that lands mid-edit, where reading the count
+    into a form and posting it back always can.
+
+    populate_existing=True is load-bearing and its absence looks like nothing.
+    Without it Session.get takes the lock and then hands back whatever version of
+    the row is already in the identity map, so the delta is applied to a stale
+    number - the exact failure the lock was taken to prevent, with the whole
+    suite still green because SQLite ignores FOR UPDATE.
+    """
+    variant = db.get(
+        ProductVariant, variant_id, with_for_update=True, populate_existing=True
+    )
+    if variant is None or variant.product_id != product_id:
+        raise VariantNotFound("Variant not found")
+
+    new_stock = variant.stock + delta
+    if new_stock < 0:
+        # Reported against what is actually on the shelf now, which may not be
+        # what the admin saw when they opened the page - that being the reason
+        # this endpoint exists.
+        raise ValueError(
+            f"Cannot remove {abs(delta)} from a stock of {variant.stock}"
+        )
+
+    variant.stock = new_stock
+    db.commit()
+    db.refresh(variant)
+
+    # Logged, because a count that changed with no record of why is the thing
+    # this endpoint was built to stop. The reason is optional and free text -
+    # not an audit table, which is more than one admin needs - but the delta and
+    # the resulting count are always here.
+    logger.info(
+        "stock adjusted: variant=%s catalog_id=%s delta=%+d now=%d reason=%s",
+        variant.id,
+        variant.catalog_id,
+        delta,
+        variant.stock,
+        reason or "-",
+    )
+    return variant
+

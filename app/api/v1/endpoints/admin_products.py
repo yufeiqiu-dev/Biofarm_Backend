@@ -9,8 +9,16 @@ from app.db.session import get_db
 from app.dependencies.auth import require_admin
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
-from app.schemas.product import ProductCreate, ProductOut, ProductUpdate
+from app.schemas.product import (
+    ProductCreate,
+    ProductOut,
+    ProductUpdate,
+    ProductVariantOut,
+    VariantStockAdjustment,
+)
 from app.services.product_service import (
+    VariantNotFound,
+    adjust_variant_stock,
     create_product,
     delete_product,
     get_product_by_id,
@@ -122,3 +130,35 @@ def remove_product(
 
     delete_product(db, product_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/{product_id}/variants/{variant_id}/stock",
+    response_model=ProductVariantOut,
+)
+def adjust_stock(
+    product_id: UUID,
+    variant_id: UUID,
+    payload: VariantStockAdjustment,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    """Add to or remove from a variant's stock.
+
+    Separate from the product PUT because the two are different operations. The
+    PUT is a form: it reads the whole product, the admin edits one field, and it
+    writes everything back - including a stock count read before they started
+    typing, overwriting whatever sold in between. This applies a change instead,
+    computed under a row lock, so a sale landing mid-adjustment is kept.
+    """
+    try:
+        return adjust_variant_stock(
+            db, product_id, variant_id, payload.delta, reason=payload.reason
+        )
+    except VariantNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        # Everything else the service refuses is a bad request - today, driving
+        # the count negative.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
