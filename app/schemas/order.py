@@ -112,6 +112,23 @@ class OrderOut(BaseModel):
 
 class AdminOrderOut(OrderOut):
     user_id: str
+    # Days until Stripe's hold on the card lapses; None once the money has moved
+    # or been released. Negative means it already has - worth showing rather
+    # than clamping, since "expired 3 days ago" and "expires today" are
+    # different problems.
+    authorization_days_remaining: Optional[float] = None
+    # When the card was actually charged, or null if it has not been.
+    #
+    # Exposed so the console can branch on the same fact the backend does.
+    # Deriving it from status in the UI is what left the cancel dialog telling
+    # an admin "no charge has been made" about an order that had been charged.
+    # datetime, matching the column and every other timestamp on these schemas.
+    # As Optional[str] it worked only because the builder hand-converted with
+    # .isoformat(); AdminOrderOut sets from_attributes=True, so the obvious next
+    # step - model_validate(order), or returning a bare Order under this
+    # response_model - raised a ValidationError and 500'd. It also published
+    # `type: string` with no format in the OpenAPI schema.
+    captured_at: Optional[datetime] = None
     customer_email: str = ""
     stripe_payment_intent_id: str
     items: list[AdminOrderItemOut] = Field(default_factory=list)

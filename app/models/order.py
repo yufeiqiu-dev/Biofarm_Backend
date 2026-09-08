@@ -63,6 +63,20 @@ class Order(Base):
     card_last4: Mapped[str] = mapped_column(String(4), nullable=False, server_default="")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     tracking_number: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When the money was actually taken, or NULL if it has not been.
+    #
+    # A fact, not an inference. Capture used to be deduced from status - before
+    # the capture moved to confirm, `confirmed` meant "not captured"; after, it
+    # meant "captured" - so the same status meant opposite things either side of
+    # a deploy. Orders in flight would have shipped unpaid, and cancelling one
+    # would have attempted a refund on an uncaptured intent, which Stripe
+    # rejects: an order that could not be cancelled at all.
+    #
+    # Recording it also makes the capture idempotent. A retry after a failed
+    # commit would otherwise capture a second time, which Stripe also rejects.
+    captured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default="0.00")
     # What the customer paid to have it sent. Stored rather than recomputed: the

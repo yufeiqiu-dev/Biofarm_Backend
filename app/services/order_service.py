@@ -22,12 +22,170 @@ from app.services import email_service
 _ORDER_NUMBER_ATTEMPTS = 5
 
 
+# How long Stripe holds a manual-capture authorisation before it lapses.
+#
+# Checkout only authorises; the money is captured when the admin confirms. So an
+# order sitting *unconfirmed* past this window has an authorisation that has
+# quietly died, and confirming it fails.
+#
+# This used to be the deadline on shipping, which was the wrong step to hang it
+# on: packing cold-chain goods and waiting for a courier can outrun a week,
+# while confirming is a click. Moving the capture to confirm shortened the race
+# to something an admin can reasonably win; the clock still matters, because an
+# order can still be left unconfirmed over a holiday.
+AUTHORIZATION_HOLD_DAYS = 7
+
+# When to start saying so. Two days is enough to act on without the warning
+# being permanently on screen.
+AUTHORIZATION_WARN_DAYS = 2
+
+# Statuses where an order is still live and could still be captured. Whether it
+# *has* been is captured_at's job, not this tuple's.
+#
+# This listed only pending and awaiting_fulfillment, on the reasoning that
+# confirming captures - true for orders confirmed under the new rule, and wrong
+# for the ones this whole design exists to handle. An order confirmed before the
+# capture moved has status=confirmed and captured_at=NULL: a live hold, still
+# ticking, which the ship path will try to capture. Keyed on status alone it got
+# no warning anywhere, which is exactly the failure the clock was added to
+# surface.
+LIVE_UNSHIPPED_STATUSES = (
+    OrderStatus.pending,
+    OrderStatus.awaiting_fulfillment,
+    OrderStatus.confirmed,
+)
+
+
+# The two card-hold cohorts, as SQL.
+#
+# Defined once because the dashboard counts them and the order list has to show
+# the same rows. When each spelled out its own window, the tile counted three
+# orders and the link it offered led to a list that could not show them - an
+# alarm with no route to the thing it was alarming about.
+HOLD_EXPIRING = "expiring"
+HOLD_EXPIRED = "expired"
+HOLD_FILTERS = (HOLD_EXPIRING, HOLD_EXPIRED)
+
+
+def hold_criteria(hold: str, now: datetime | None = None) -> list:
+    """Where-clauses selecting orders by the state of their card authorisation.
+
+    `expiring` is still chargeable but running out; `expired` has passed the
+    window, so shipping it now fails at capture and the honest action is to
+    cancel and return the stock. The advice differs, which is why they are two
+    cohorts rather than one "old orders" bucket.
+
+    Both are bounded to live, unshipped, uncaptured orders: once the money has
+    moved there is no hold left to lapse.
+    """
+    if hold not in HOLD_FILTERS:
+        raise ValueError(f"Unknown hold filter: {hold}")
+
+    now = now or datetime.now(tz=timezone.utc)
+    warn_from = now - timedelta(days=AUTHORIZATION_HOLD_DAYS - AUTHORIZATION_WARN_DAYS)
+    dead_from = now - timedelta(days=AUTHORIZATION_HOLD_DAYS)
+
+    criteria = [
+        Order.status.in_(LIVE_UNSHIPPED_STATUSES),
+        Order.captured_at.is_(None),
+    ]
+    if hold == HOLD_EXPIRING:
+        criteria += [Order.created_at <= warn_from, Order.created_at > dead_from]
+    else:
+        # Deliberately open-ended at the far end. An expired hold was bounded to
+        # a fortnight so one abandoned order could not pin a red tile forever -
+        # but the order goes on holding its stock indefinitely, and dropping it
+        # from the dashboard made that leak invisible rather than fixing it. The
+        # tile now links to exactly these rows, so an admin clears it by
+        # cancelling them, which is the action that returns the stock.
+        criteria.append(Order.created_at <= dead_from)
+    return criteria
+
+
+# What a customer may cancel themselves.
+#
+# Named because two paths' correctness depends on it, and it was written out
+# twice. Capture happens at confirm - and happened at ship before that - so the
+# money has provably not moved in any status here. That is what lets the cancel
+# endpoint trust captured_at alone instead of asking Stripe on every
+# cancellation. Adding `confirmed` would silently start voiding intents that
+# hold real money.
+#
+# Lives in the service rather than the endpoint because the service holds the
+# other copy, and a service importing from an endpoint inverts the layering.
+CUSTOMER_CANCELLABLE_STATUSES = (OrderStatus.pending, OrderStatus.awaiting_fulfillment)
+
+
+def authorization_days_remaining(order: Order) -> float | None:
+    """Days before this order's authorisation lapses, or None if it cannot.
+
+    Negative once it already has - which is worth showing rather than clamping,
+    because "expired 3 days ago" and "expires today" call for different actions.
+
+    Measured from created_at. The authorisation is placed when the customer
+    pays, which is when the webhook creates the order; the two are minutes
+    apart, and the window is a week.
+    """
+    # Both conditions. The status says the order is still live; captured_at says
+    # whether there is still a hold to lose.
+    if order.status not in LIVE_UNSHIPPED_STATUSES:
+        return None
+    if order.captured_at is not None:
+        return None
+
+    created = order.created_at
+    if created is None:
+        return None
+    if created.tzinfo is None:
+        # SQLite hands back naive datetimes; Postgres tz-aware ones.
+        created = created.replace(tzinfo=timezone.utc)
+
+    expires = created + timedelta(days=AUTHORIZATION_HOLD_DAYS)
+    return round((expires - datetime.now(tz=timezone.utc)).total_seconds() / 86400, 2)
+
+
 def _load_order(db: Session, order_id: uuid.UUID) -> Order | None:
     return db.scalar(
         select(Order)
         .options(selectinload(Order.items))
         .where(Order.id == order_id)
     )
+
+
+def load_order_for_update(db: Session, order_id: uuid.UUID) -> Order | None:
+    """Load an order with its row locked for the rest of the transaction.
+
+    Every money decision on an order is a read followed by a write - is it
+    captured, may it be cancelled, has it shipped - and without a lock two
+    admins acting at once both read the same "not captured yet" and both act on
+    it. Measured against real Postgres: two simultaneous confirms produced two
+    captures, and Stripe rejects the second, so the admin sees a failure on an
+    order that was in fact charged.
+
+    populate_existing for the same reason it is needed when taking stock: get()
+    will take the lock and leave already-loaded attributes stale, so the read
+    that follows would be the value from before the wait.
+
+    The Stripe call then happens while this lock is held, which is a network
+    round trip inside a transaction. That is a real cost and it is the right
+    trade here: the rows are per-order, one admin is the expected load, and the
+    alternative is charging a customer twice.
+    """
+    return db.get(Order, order_id, with_for_update=True, populate_existing=True)
+
+
+# Newest first, with id as a tiebreaker.
+#
+# The tiebreak is the load-bearing half. created_at is not unique - Postgres
+# now() is transaction-start, so anything written together ties, and SQLite's
+# CURRENT_TIMESTAMP only has second granularity. With ties, LIMIT/OFFSET has no
+# defined order between one page request and the next: OFFSET does not remember
+# what the previous page returned, it re-runs the query and skips N. A row can
+# then appear on two pages while another is never shown at all.
+#
+# Named once because both listings must sort identically; they diverged silently
+# when each spelled it out.
+ORDER_LISTING_SORT = (Order.created_at.desc(), Order.id.desc())
 
 
 def _load_order_by_pi(db: Session, pi_id: str) -> Order | None:
@@ -341,11 +499,7 @@ def get_orders_for_user(db: Session, user_id: str) -> list[Order]:
             select(Order)
             .options(selectinload(Order.items))
             .where(Order.user_id == user_id)
-            # id as a tiebreaker: created_at is not unique, and Postgres now() is
-        # transaction-start, so anything seeded or backfilled together ties. With
-        # ties, LIMIT/OFFSET has no defined order between the count query and the
-        # page query - a row can appear on two pages, or on none.
-        .order_by(Order.created_at.desc(), Order.id.desc())
+            .order_by(*ORDER_LISTING_SORT)
         ).all()
     )
 
@@ -372,6 +526,7 @@ def confirm_order_admin(db: Session, order_id: uuid.UUID) -> Order:
     # moved - and a second customer who had already paid for the last unit only
     # found out when this raised.
     order.status = OrderStatus.confirmed
+
     db.commit()
     db.refresh(order)
     return order
@@ -460,7 +615,7 @@ def cancel_order_by_customer(db: Session, order_id: uuid.UUID, user_id: str) -> 
     order = _load_order(db, order_id)
     if order is None or order.user_id != user_id:
         raise ValueError("Order not found")
-    if order.status not in (OrderStatus.pending, OrderStatus.awaiting_fulfillment):
+    if order.status not in CUSTOMER_CANCELLABLE_STATUSES:
         raise ValueError(f"Cannot cancel order in status {order.status.value}")
 
     return cancel_order(db, order_id)
@@ -478,6 +633,7 @@ def list_all_orders(
     status: OrderStatus | None = None,
     search: str | None = None,
     also_user_id: str | None = None,
+    hold: str | None = None,
     limit: int = DEFAULT_ORDER_PAGE_SIZE,
     offset: int = 0,
 ) -> tuple[list[Order], int]:
@@ -498,6 +654,10 @@ def list_all_orders(
     filters = []
     if status:
         filters.append(Order.status == status)
+    if hold:
+        # Shared with the dashboard tiles that link here, so the count and the
+        # list it points at cannot drift apart.
+        filters.extend(hold_criteria(hold))
 
     if search and search.strip():
         term = f"%{search.strip()}%"
@@ -535,11 +695,7 @@ def list_all_orders(
         select(Order)
         .where(*filters)
         .options(selectinload(Order.items))
-        # id as a tiebreaker: created_at is not unique, and Postgres now() is
-        # transaction-start, so anything seeded or backfilled together ties. With
-        # ties, LIMIT/OFFSET has no defined order between the count query and the
-        # page query - a row can appear on two pages, or on none.
-        .order_by(Order.created_at.desc(), Order.id.desc())
+        .order_by(*ORDER_LISTING_SORT)
         .limit(limit)
         .offset(offset)
     )

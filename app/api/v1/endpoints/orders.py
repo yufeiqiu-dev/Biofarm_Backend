@@ -14,15 +14,21 @@ from app.models.product_variant import ProductVariant
 from app.models.order import OrderStatus
 from app.schemas.order import CreatePaymentIntentRequest, OrderOut, PaymentIntentResponse
 from app.services.order_service import (
+    CUSTOMER_CANCELLABLE_STATUSES,
     cancel_order_by_customer,
     create_order,
+    load_order_for_update,
     get_order_by_id,
     get_order_by_payment_intent,
     get_orders_for_user,
     save_checkout_session,
 )
 from app.services.shipping_service import calculate_shipping
-from app.services.stripe_service import calculate_tax, cancel_payment_intent, create_payment_intent
+from app.services.stripe_service import (
+    release_funds,
+    calculate_tax,
+    create_payment_intent,
+)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -246,17 +252,39 @@ def cancel_my_order(
     db: Session = Depends(get_db),
     current_user: dict = Depends(require_user),
 ):
-    order = get_order_by_id(db, order_id)
+    # Locked, like the admin paths. Unlocked, a customer cancelling while an
+    # admin confirms read "awaiting_fulfillment", then voided an intent the
+    # admin had just captured - or the admin captured one this had just voided.
+    # Either way one side sees a 502 on an order whose money has already moved.
+    # The admin cancel's lock gave no protection, because this path never took
+    # it.
+    order = load_order_for_update(db, order_id)
     if order is None or order.user_id != current_user["sub"]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    if order.status not in (OrderStatus.pending, OrderStatus.awaiting_fulfillment):
+    if order.status not in CUSTOMER_CANCELLABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel order in status '{order.status.value}'"
         )
 
+    # Branches on whether the money moved, not on the status - and voids or
+    # refunds accordingly. The allowed statuses used to imply "uncaptured", and
+    # stopped implying it when the capture moved to confirm.
     try:
-        cancel_payment_intent(order.stripe_payment_intent_id)
+        # Same helper as the admin path, so the two cancels cannot disagree
+        # about how money comes back.
+        #
+        # This path used to reason that a customer-cancellable status can never
+        # have been captured, and skip the question entirely. That was nearly
+        # true and wrong where it mattered: confirm captures and then commits,
+        # and a rolled-back commit leaves the money taken with the row still
+        # reading awaiting_fulfillment and captured_at NULL. A customer
+        # cancelling in that window took the void branch, Stripe rejected it on
+        # a succeeded intent, and they got a 502 on every retry.
+        release_funds(
+            order.stripe_payment_intent_id,
+            known_captured=order.captured_at is not None,
+        )
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe operation failed: {e}")
 

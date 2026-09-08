@@ -153,8 +153,14 @@ def send_order_cancelled(order: Order) -> None:
     """Sent on cancellation, by either the customer or an admin.
 
     Says what happened to the money, because that is the only question a
-    cancellation email needs to answer: before shipping the authorization is
-    voided and nothing was ever taken; afterwards it is refunded.
+    cancellation email needs to answer.
+
+    The body hedges rather than naming a boundary, and that is deliberate. The
+    boundary used to be shipping; it is confirm now, since that is where capture
+    moved - and a legacy row or a confirm whose commit rolled back can be
+    captured while its status says otherwise, so the status does not settle it
+    either. release_funds attempts the void and refunds if Stripe says the money
+    already moved, which means only Stripe knows at the time this is written.
     """
     body = (
         f"Your order has been cancelled.\n\n"

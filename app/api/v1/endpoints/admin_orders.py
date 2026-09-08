@@ -1,6 +1,7 @@
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -19,13 +20,19 @@ from app.services.order_service import (
     deliver_order,
     get_order_by_id,
     DEFAULT_ORDER_PAGE_SIZE,
+    HOLD_FILTERS,
     MAX_ORDER_PAGE_SIZE,
+    authorization_days_remaining,
     list_all_orders,
+    load_order_for_update,
     ship_order,
     update_tracking_number,
 )
 from app.services.cognito_service import get_account
-from app.services.stripe_service import cancel_payment_intent, capture_payment_intent, create_refund
+from app.services.stripe_service import (
+    release_funds,
+    capture_payment_intent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,8 @@ def _enrich_items_with_stock(order, db: Session):
 def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
     items = _enrich_items_with_stock(order, db)
     return AdminOrderOut(
+        authorization_days_remaining=authorization_days_remaining(order),
+        captured_at=order.captured_at,
         id=order.id,
         order_number=order.order_number,
         user_id=order.user_id,
@@ -68,6 +77,14 @@ def _build_admin_order_out(order, db: Session) -> AdminOrderOut:
         stripe_payment_intent_id=order.stripe_payment_intent_id,
         total_amount=order.total_amount,
         tax_amount=order.tax_amount,
+        # Omitted until now, and the schema default of 0 made that silent: every
+        # admin response reported no shipping whatever the order held. It was a
+        # display bug while nothing added the parts up; the confirm dialog now
+        # quotes total_amount + shipping + tax as the sum about to be charged,
+        # so a missing fee means telling an admin they are charging less than
+        # Stripe actually captures - and the customer's own order page, built
+        # from the ORM object, shows the real figure.
+        shipping_amount=order.shipping_amount,
         shipping_name=order.shipping_name,
         shipping_phone=order.shipping_phone,
         shipping_address1=order.shipping_address1,
@@ -136,11 +153,30 @@ def list_orders(
             "somewhere else."
         ),
     ),
+    hold: Optional[str] = Query(
+        default=None,
+        description=(
+            "Narrow to orders by the state of their card authorisation: "
+            "'expiring' (running out, still chargeable) or 'expired' (past the "
+            "window, so shipping fails at capture). These are what the dashboard "
+            "card-hold tiles link to."
+        ),
+    ),
     limit: int = Query(default=DEFAULT_ORDER_PAGE_SIZE, ge=1, le=MAX_ORDER_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
+    # `?hold=` with no value is absent, not invalid - the same reading `status`
+    # gets. A cleared filter often serialises as an empty parameter, and 400ing
+    # on it turns a link that merely says nothing into an error page.
+    hold = hold or None
+    if hold is not None and hold not in HOLD_FILTERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid hold filter: {hold}",
+        )
+
     order_status = None
     if status_filter:
         try:
@@ -155,6 +191,7 @@ def list_orders(
         order_status,
         search=search,
         also_user_id=_sub_for_search(search),
+        hold=hold,
         limit=limit,
         offset=offset,
     )
@@ -185,22 +222,84 @@ def update_order_status(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
-    order = get_order_by_id(db, order_id)
+    # Locked for the whole transition. Everything below reads the order and then
+    # acts on what it read - captured or not, shippable or not - and two admins
+    # doing that at once both acted on the same stale answer.
+    order = load_order_for_update(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     try:
         if payload.status == "confirmed":
+            # Captured here, not at ship. Checkout only authorises, and a card
+            # hold lapses after about a week - so capturing at ship put the
+            # deadline on the slowest step. Packing cold-chain goods and waiting
+            # for a courier can outrun the hold, and the failure surfaced with
+            # the box already packed and the stock already deducted.
+            #
+            # Confirming is a click, comfortably inside the window, and it is
+            # already the moment the admin commits: stock has been validated and
+            # set aside. Taking the money there means shipping is no longer on a
+            # clock.
+            #
+            # The cost is that walking away is no longer free. Cancelling after
+            # this refunds rather than voids, and Stripe keeps its fee - see
+            # cancel_order below, where the boundary moved to match.
+            #
+            # Before the status change, deliberately: a confirmed order whose
+            # capture failed would otherwise sit with its stock deducted and no
+            # money behind it.
+            if order.status != OrderStatus.awaiting_fulfillment:
+                raise ValueError(f"Cannot confirm order in status {order.status.value}")
+
+            # Skipped if it already happened. Without the record, a retry after a
+            # failed commit captured a second time, which Stripe rejects - a
+            # permanent 502 on an order that could never be confirmed.
+            if order.captured_at is None:
+                try:
+                    # Asked, not assumed. Committing captured_at separately made
+                    # it durable but ended the transaction, releasing the row
+                    # lock between the capture and the status change - and a
+                    # cancel landing in that gap refunded and restocked an order
+                    # that then became confirmed. Charged, refunded, restocked
+                    # and confirmed, all at once.
+                    #
+                    # So this stays one transaction, and the rollback case is
+                    # handled by asking Stripe whether the money already moved
+                    # rather than by trusting a record that may not have
+                    # survived. Stripe is authoritative for that, as it is for
+                    # every other money question here.
+                    capture_payment_intent(order.stripe_payment_intent_id)
+                except Exception as e:
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe capture failed: {e}")
+
+                # Set, not committed. confirm_order_admin's commit persists this
+                # with the status change, so the lock taken above is held across
+                # both and the interleaving cannot happen.
+                order.captured_at = datetime.now(tz=timezone.utc)
+
             order = confirm_order_admin(db, order_id)
         elif payload.status == "shipped":
             if order.status != OrderStatus.confirmed:
                 raise ValueError(f"Cannot ship order in status {order.status.value}")
-            # Capture payment BEFORE committing status change — avoids a stuck
-            # "shipped" order if Stripe is unavailable (no retry path once shipped).
-            try:
-                capture_payment_intent(order.stripe_payment_intent_id)
-            except Exception as e:
-                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe capture failed: {e}")
+
+            # Normally a no-op: the money was taken at confirm. It matters for
+            # orders confirmed *before* the capture moved, which carry no
+            # captured_at - without this they would ship and the authorisation
+            # would lapse uncaptured, and the merchant would never be paid.
+            # No backfill needed; the fact is checked rather than the status.
+            if order.captured_at is None:
+                try:
+                    # Same shape as confirm, deliberately: the two money-moving
+                    # branches must not disagree about how a lost record
+                    # recovers.
+                    capture_payment_intent(order.stripe_payment_intent_id)
+                except Exception as e:
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe capture failed: {e}")
+                # Set, not committed: ship_order's commit persists it, keeping the
+                # transition one transaction and the lock unbroken.
+                order.captured_at = datetime.now(tz=timezone.utc)
+
             order = ship_order(db, order_id, tracking_number=payload.tracking_number)
         elif payload.status == "delivered":
             order = deliver_order(db, order_id)
@@ -234,7 +333,11 @@ def cancel_order_endpoint(
     db: Session = Depends(get_db),
     current_user=Depends(require_admin),
 ):
-    order = get_order_by_id(db, order_id)
+    # Locked for the same reason as the status transition: this reads whether
+    # the money moved and then voids or refunds on the answer. A confirm running
+    # concurrently would otherwise charge the card while this cancelled the
+    # order and took the void branch - charged, cancelled, and never refunded.
+    order = load_order_for_update(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
@@ -245,12 +348,29 @@ def cancel_order_endpoint(
         )
 
     try:
-        # Capture happens at ship time — anything before shipped has no charge, just void the auth.
-        # shipped/delivered means money was already captured, so issue a refund.
-        if order.status in (OrderStatus.pending, OrderStatus.awaiting_fulfillment, OrderStatus.confirmed):
-            cancel_payment_intent(order.stripe_payment_intent_id)
-        else:
-            create_refund(order.stripe_payment_intent_id)
+        # Asks Stripe, like confirm and ship do. This was the third money branch
+        # and the one left behind.
+        #
+        # Void or refund, decided by where the money actually got to.
+        #
+        # Neither local answer is trustworthy on its own. `captured_at` is NULL
+        # on every row predating the column - including orders shipped under the
+        # old rule, where capture happened at ship and the money really did move
+        # - so trusting it alone voids a captured intent, which Stripe rejects,
+        # and the customer is never refunded. Status stopped implying anything
+        # about capture the moment that moved to confirm.
+        #
+        # Asking Stripe up front was the first fix and cost too much: a live
+        # retrieve on every cancellation, inside this `try` whose handler is a
+        # 502, while the row lock is held. A blip on a call that usually only
+        # confirms what we already knew wedged the cancellation.
+        #
+        # release_funds discovers it instead - one round trip normally, and the
+        # rare captured-but-unrecorded case corrects itself.
+        release_funds(
+            order.stripe_payment_intent_id,
+            known_captured=order.captured_at is not None,
+        )
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Stripe operation failed: {e}")
 

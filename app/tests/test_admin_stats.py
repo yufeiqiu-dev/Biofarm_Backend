@@ -373,3 +373,238 @@ def test_an_order_dated_tomorrow_does_not_vanish_from_the_total(
     body = admin_client.get("/api/v1/admin/stats").json()
 
     assert body["daily"][-1]["cumulative"] == body["volume"]["all_time"]
+
+
+# --- the authorisation clock -------------------------------------------------
+#
+# Checkout only authorises; the money moves when an admin confirms. Card
+# networks let a hold stand about seven days, after which it lapses and cannot
+# be captured - so an order sitting unconfirmed past that can no longer be
+# charged at all, with its stock deducted at creation and held the whole time.
+# Nothing counted those days.
+
+class TestAuthorizationClock:
+    def test_a_fresh_order_has_the_full_window(self, db_session):
+        from app.services.order_service import (
+            AUTHORIZATION_HOLD_DAYS,
+            authorization_days_remaining,
+        )
+
+        order, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+
+        remaining = authorization_days_remaining(order)
+
+        assert remaining is not None
+        assert AUTHORIZATION_HOLD_DAYS - 0.1 < remaining <= AUTHORIZATION_HOLD_DAYS
+
+    def test_it_counts_down(self, db_session):
+        from app.services.order_service import authorization_days_remaining
+
+        order, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        order.created_at = datetime.now(tz=timezone.utc) - timedelta(days=5)
+        db_session.commit()
+
+        assert 1.9 < authorization_days_remaining(order) < 2.1
+
+    def test_an_expired_hold_reports_a_negative_number(self, db_session):
+        """Not clamped to zero: "expired 3 days ago" and "expires today" are
+        different problems and call for different actions."""
+        from app.services.order_service import authorization_days_remaining
+
+        order, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        order.created_at = datetime.now(tz=timezone.utc) - timedelta(days=10)
+        db_session.commit()
+
+        assert authorization_days_remaining(order) < 0
+
+    def test_a_captured_order_has_no_clock(self, db_session):
+        """Once the money is taken there is no hold left to lapse."""
+        from app.services.order_service import authorization_days_remaining
+
+        order, _ = make_order(db_session, status=OrderStatus.confirmed)
+        order.captured_at = datetime.now(tz=timezone.utc)
+        db_session.commit()
+
+        assert authorization_days_remaining(order) is None
+
+    def test_an_order_confirmed_before_the_capture_moved_still_has_a_clock(self, db_session):
+        """status=confirmed with captured_at NULL is a live hold, still ticking,
+        and the ship path will try to capture it.
+
+        Keyed on status alone this got no warning anywhere - the exact
+        population the clock exists to surface, invisible to it.
+        """
+        from app.services.order_service import authorization_days_remaining
+
+        order, _ = make_order(db_session, status=OrderStatus.confirmed)
+        assert order.captured_at is None
+
+        assert authorization_days_remaining(order) is not None
+
+    def test_a_shipped_order_has_no_clock(self, db_session):
+        """Captured before it ever got here."""
+        from app.services.order_service import authorization_days_remaining
+
+        order, _ = make_order(db_session, status=OrderStatus.shipped)
+
+        assert authorization_days_remaining(order) is None
+
+    def test_a_cancelled_order_has_no_clock(self, db_session):
+        """Cancelling voids or refunds it - either way the clock is spent."""
+        from app.services.order_service import authorization_days_remaining
+
+        order, _ = make_order(db_session, status=OrderStatus.cancelled)
+
+        assert authorization_days_remaining(order) is None
+
+    def test_the_admin_order_carries_it(self, admin_client: TestClient, db_session):
+        order, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+
+        body = admin_client.get(f"/api/v1/admin/orders/{order.id}").json()
+
+        assert body["authorization_days_remaining"] is not None
+
+
+class TestExpiringCount:
+    def test_the_dashboard_counts_holds_about_to_lapse(
+        self, admin_client: TestClient, db_session
+    ):
+        old, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        old.created_at = datetime.now(tz=timezone.utc) - timedelta(days=6)
+        make_order(db_session, status=OrderStatus.awaiting_fulfillment)  # fresh
+        db_session.commit()
+
+        queue = admin_client.get("/api/v1/admin/stats").json()["queue"]
+
+        assert queue["authorization_expiring"] == 1
+
+    def test_a_shipped_order_is_not_counted(self, admin_client: TestClient, db_session):
+        """Its money was captured, so nothing is waiting to lapse."""
+        old, _ = make_order(db_session, status=OrderStatus.shipped)
+        old.created_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+        db_session.commit()
+
+        queue = admin_client.get("/api/v1/admin/stats").json()["queue"]
+
+        assert queue["authorization_expiring"] == 0
+
+    def test_a_cancelled_order_is_not_counted(self, admin_client: TestClient, db_session):
+        old, _ = make_order(db_session, status=OrderStatus.cancelled)
+        old.created_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+        db_session.commit()
+
+        assert admin_client.get("/api/v1/admin/stats").json()["queue"]["authorization_expiring"] == 0
+
+    def test_nothing_old_means_nothing_to_warn_about(
+        self, admin_client: TestClient, db_session
+    ):
+        make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+
+        assert admin_client.get("/api/v1/admin/stats").json()["queue"]["authorization_expiring"] == 0
+
+
+    def test_a_long_abandoned_order_keeps_being_counted(
+        self, admin_client: TestClient, db_session
+    ):
+        """It is still holding its stock, so it is still a problem.
+
+        This count used to stop at a fortnight, so an abandoned order dropped
+        off the dashboard while going on reserving inventory indefinitely - and
+        nothing sweeps them. That hid the leak rather than fixing it: the only
+        thing that would have told an admin the order existed was the tile that
+        had quietly stopped counting it.
+
+        The original worry - one dead order pinning a red tile forever - is
+        answered by the tile linking to exactly these rows. Cancelling them
+        clears the tile *and* returns the stock, so the alarm is now clearable
+        by doing the right thing rather than by waiting.
+        """
+        old, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        old.created_at = datetime.now(tz=timezone.utc) - timedelta(days=120)
+        db_session.commit()
+
+        queue = admin_client.get("/api/v1/admin/stats").json()["queue"]
+
+        assert queue["authorization_expired"] == 1
+        assert queue["authorization_expiring"] == 0, "long gone, not 'about to lapse'"
+
+    def test_the_expired_tile_links_to_a_list_that_shows_those_orders(
+        self, admin_client: TestClient, db_session
+    ):
+        """The alarm must have a route to what it is alarming about.
+
+        Both tiles used to link to ?status=all, which is newest-first with a
+        page size of 50 and no age filter or sort. The orders being counted are
+        by definition the oldest live ones, so past 50 orders in five days the
+        admin landed on a page that could not contain any of them.
+        """
+        stale, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        stale.created_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+        fresh, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        db_session.commit()
+
+        body = admin_client.get("/api/v1/admin/orders?hold=expired").json()
+
+        assert body["total"] == 1
+        assert body["items"][0]["id"] == str(stale.id)
+
+    def test_the_expiring_tile_links_to_its_own_cohort(
+        self, admin_client: TestClient, db_session
+    ):
+        """The advice differs between the two, so the lists must too - shipping
+        an already-lapsed order fails at capture."""
+        soon, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        soon.created_at = datetime.now(tz=timezone.utc) - timedelta(days=6)
+        gone, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        gone.created_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+        db_session.commit()
+
+        body = admin_client.get("/api/v1/admin/orders?hold=expiring").json()
+
+        assert body["total"] == 1
+        assert body["items"][0]["id"] == str(soon.id)
+
+    def test_the_tile_count_and_its_list_agree(
+        self, admin_client: TestClient, db_session
+    ):
+        """The thing that actually has to hold. Two hand-written copies of the
+        window is how they came apart in the first place."""
+        for age in (6, 9, 30, 200):
+            order, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+            order.created_at = datetime.now(tz=timezone.utc) - timedelta(days=age)
+        db_session.commit()
+
+        queue = admin_client.get("/api/v1/admin/stats").json()["queue"]
+        for tile, hold in (
+            ("authorization_expiring", "expiring"),
+            ("authorization_expired", "expired"),
+        ):
+            listed = admin_client.get(f"/api/v1/admin/orders?hold={hold}").json()["total"]
+            assert queue[tile] == listed, f"{tile} counts {queue[tile]} but lists {listed}"
+
+    def test_an_empty_hold_filter_is_absent_not_invalid(
+        self, admin_client: TestClient, db_session
+    ):
+        """A cleared filter often serialises as `?hold=`. 400ing on it turns a
+        link that merely says nothing into an error page."""
+        make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        db_session.commit()
+
+        response = admin_client.get("/api/v1/admin/orders?hold=")
+
+        assert response.status_code == 200
+        assert response.json()["total"] == 1, "an empty filter must not narrow anything"
+
+    def test_an_unknown_hold_filter_is_rejected(self, admin_client: TestClient):
+        """Rather than silently ignored, which would show every order under a
+        heading promising only the at-risk ones."""
+        assert admin_client.get("/api/v1/admin/orders?hold=whenever").status_code == 400
+
+    def test_a_recently_lapsed_order_is_still_reported(
+        self, admin_client: TestClient, db_session
+    ):
+        old, _ = make_order(db_session, status=OrderStatus.awaiting_fulfillment)
+        old.created_at = datetime.now(tz=timezone.utc) - timedelta(days=9)
+        db_session.commit()
+
+        assert admin_client.get("/api/v1/admin/stats").json()["queue"]["authorization_expired"] == 1
