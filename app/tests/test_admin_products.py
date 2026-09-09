@@ -190,7 +190,9 @@ def test_update_product_variant_not_belonging_to_product(admin_client: TestClien
     foreign_variant_id = str(p1.variants[0].id)
 
     response = admin_client.put(f"/api/v1/admin/products/{p2.id}", json={
-        "variants": [{"id": foreign_variant_id, "catalog_id": "X", "size_value": 1, "size_unit": "mL", "price": 1.0, "stock": 1}]
+        # No stock: it is rejected on an existing variant now, and sending it
+        # would make this assert 422 for the wrong reason.
+        "variants": [{"id": foreign_variant_id, "catalog_id": "X", "size_value": 1, "size_unit": "mL", "price": 1.0}]
     })
     assert response.status_code == 400
 

@@ -330,7 +330,7 @@ def test_a_customer_cancelling_their_own_order_returns_the_stock(
     db_session.expire_all()
     assert db_session.get(ProductVariant, variant.id).stock == 2, "creation should have taken 3"
 
-    with patch("app.api.v1.endpoints.orders.cancel_payment_intent"):
+    with patch("app.services.stripe_service.cancel_payment_intent"):
         response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
 
     assert response.status_code == 200
@@ -358,3 +358,40 @@ def test_the_service_level_customer_cancel_returns_stock_too(db_session):
 
     db_session.expire_all()
     assert db_session.get(ProductVariant, variant.id).stock == 4
+
+
+# --- the order row itself ----------------------------------------------------
+#
+# Every money decision on an order reads it and then acts on what it read: is it
+# captured, may it be cancelled, has it shipped. Without a lock two admins doing
+# that at once both act on the same stale answer. Measured against real
+# Postgres, two simultaneous confirms produced two captures - and Stripe rejects
+# the second, so the admin sees a failure on an order that was in fact charged.
+#
+# Asserted on the request, not the outcome, for the reason at the top of this
+# file: SQLite ignores FOR UPDATE. scripts/check_capture_race.py is the version
+# that proves it.
+
+def test_the_order_is_locked_before_a_money_decision(db_session, monkeypatch):
+    from app.models.order import Order
+    from app.services.order_service import load_order_for_update
+
+    order, _ = make_order(db_session, stock=5)
+
+    calls: list[dict] = []
+    real_get = db_session.get
+
+    def spy(entity, ident, **kwargs):
+        if entity is Order:
+            calls.append(kwargs)
+        return real_get(entity, ident, **kwargs)
+
+    monkeypatch.setattr(db_session, "get", spy)
+    load_order_for_update(db_session, order.id)
+
+    assert calls, "the order was not loaded at all"
+    assert calls[0].get("with_for_update"), "the order row was read without a lock"
+    assert calls[0].get("populate_existing"), (
+        "locked without re-reading - the value used would be the one fetched "
+        "before the wait, which is the race the lock is meant to close"
+    )

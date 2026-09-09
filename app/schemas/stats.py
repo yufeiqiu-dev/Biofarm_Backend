@@ -16,6 +16,13 @@ class QueueOut(BaseModel):
     # None when nothing is waiting. The age matters more than the count: three
     # orders to confirm is a normal morning, one sitting four days is not.
     oldest_awaiting_hours: Optional[float] = None
+    # Unshipped orders whose card hold lapses within the warning window. Not a
+    # statistic: an authorisation Stripe has released cannot be captured, so
+    # each of these is work with a deadline.
+    authorization_expiring: int = 0
+    # Already lapsed. Separate from the above because the advice differs: one is
+    # "ship it now", the other is "shipping this will fail at capture".
+    authorization_expired: int = 0
     # Everything unshipped, priced pre-tax: awaiting_fulfillment and confirmed
     # together. Named for the queue rather than for "awaiting" because the two
     # fields above mean awaiting_fulfillment alone - an admin with 3 to confirm

@@ -218,3 +218,20 @@ class TestWiring:
         # The status change is committed before the send, so it survives.
         db_session.expire_all()
         assert db_session.get(type(order), order.id).status == Status.shipped
+
+
+def test_a_receipt_for_an_unflushed_order_does_not_raise(ses):
+    """shipping_amount reads None on an Order that has not been flushed - the
+    column's defaults apply at INSERT, not in __init__.
+
+    This module runs on the webhook path and must not raise: a TypeError here
+    escapes as a 500 to Stripe, which retries a payment that already succeeded.
+    """
+    order = make_order()
+    order.shipping_amount = None
+
+    email_service.send_order_confirmation(order)
+
+    body = ses.send_email.call_args.kwargs["Message"]["Body"]["Text"]["Data"]
+    assert "Shipping: $0.00" in body
+    assert "Total:    $696.00" in body, "the receipt stopped adding up"

@@ -23,6 +23,11 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.order import Order, OrderItem, OrderStatus
+from app.services.order_service import (
+    HOLD_EXPIRED,
+    HOLD_EXPIRING,
+    hold_criteria,
+)
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
 
@@ -111,7 +116,32 @@ def _queue(db: Session) -> dict[str, Any]:
         delta = datetime.now(tz=timezone.utc) - oldest
         oldest_age_hours = round(delta.total_seconds() / 3600, 1)
 
+    # Two counts, not one. An unbounded "older than five days" also swept up
+    # every hold that lapsed weeks ago, and told the admin to "ship or they
+    # lapse" - advice that is actively wrong for those, because shipping them
+    # fails at capture.
+    #
+    # The windows themselves live in order_service, shared with the order
+    # listing these tiles link to. Restating them here is how the tile and its
+    # link came to disagree about which orders they meant.
+    now = datetime.now(tz=timezone.utc)
+
+    def _count(hold: str) -> int:
+        return (
+            db.scalar(
+                select(func.count())
+                .select_from(Order)
+                .where(*hold_criteria(hold, now=now))
+            )
+            or 0
+        )
+
+    expiring = _count(HOLD_EXPIRING)
+    expired = _count(HOLD_EXPIRED)
+
     return {
+        "authorization_expiring": expiring,
+        "authorization_expired": expired,
         "to_confirm": counts.get(OrderStatus.awaiting_fulfillment, 0),
         "to_ship": counts.get(OrderStatus.confirmed, 0),
         "in_transit": counts.get(OrderStatus.shipped, 0),

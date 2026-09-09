@@ -12,7 +12,7 @@ from app.services.order_service import (
     get_order_by_payment_intent,
 )
 from app.services.stripe_service import (
-    cancel_payment_intent,
+    release_funds,
     get_card_details,
     verify_webhook_signature,
 )
@@ -69,11 +69,21 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
                 "webhook %s for payment intent %s: %s - voiding the authorisation",
                 event.type, pi.id, exc,
             )
-            # Before deleting the session, deliberately. If the void fails this
+            # Before deleting the session, deliberately. If this fails it
             # raises, the session survives, and Stripe's retry brings us back
             # here to try again. Deleting first would send the retry down the
             # "no session and no order" path instead, which 500s forever.
-            await asyncio.to_thread(cancel_payment_intent, pi.id)
+            #
+            # Through release_funds, like both cancel paths - this is the third
+            # place money comes back and it was the one left calling the void
+            # directly. Sold out is reached from payment_intent.succeeded as
+            # well as the capturable event, so the intent may already hold real
+            # money; a bare void is rejected on it, the webhook 500s, Stripe
+            # retries for days, and a charged customer with no order is never
+            # refunded.
+            await asyncio.to_thread(
+                release_funds, pi.id, known_captured=False
+            )
             delete_checkout_session(db, pi.id)
             return {"status": "ok"}
 

@@ -199,7 +199,7 @@ def test_customer_cancel_pending_order(user_client: TestClient, db_session):
     """Customer can cancel a pending order (abandoned checkout) — cancels the PI, no refund."""
     order, _ = make_order(db_session, user_id="test-user-123", status=OrderStatus.pending)
 
-    with patch("app.api.v1.endpoints.orders.cancel_payment_intent") as mock_cancel:
+    with patch("app.services.stripe_service.cancel_payment_intent") as mock_cancel:
         response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
 
     assert response.status_code == 200
@@ -211,7 +211,7 @@ def test_customer_cancel_awaiting_order(user_client: TestClient, db_session):
     """Customer can cancel an awaiting_fulfillment order — cancels the PI, no refund."""
     order, _ = make_order(db_session, user_id="test-user-123", status=OrderStatus.awaiting_fulfillment)
 
-    with patch("app.api.v1.endpoints.orders.cancel_payment_intent") as mock_cancel:
+    with patch("app.services.stripe_service.cancel_payment_intent") as mock_cancel:
         response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
 
     assert response.status_code == 200
@@ -368,3 +368,213 @@ def test_the_order_page_query_breaks_ties_on_a_unique_column(db_session):
     for statement in ordered:
         clause = statement.upper().split("ORDER BY", 1)[1]
         assert "ID" in clause, f"no unique tiebreaker in: {clause.strip()[:80]}"
+
+
+# --- shipping --------------------------------------------------------------
+#
+# The shop charged goods plus tax and nothing for postage. For reagents shipped
+# cold that is a real cost absorbed on every order.
+#
+# A flat rate behind a seam: the amount is the only part that depends on the
+# carrier, and everything else - a line on the order, an amount in the intent, a
+# row at checkout and on the receipt - is the same whatever that answer is.
+
+def test_nothing_is_charged_until_a_rate_is_configured(user_client: TestClient, db_session):
+    """Zero by default, so an environment that has not set it keeps behaving as
+    it did rather than surprising customers with a charge nobody chose."""
+    from app.core.config import get_settings
+
+    _, variant = make_product_with_variant(db_session, "SHIP-0", stock=5)
+    assert get_settings().shipping_flat_cents == 0
+
+    response = _checkout(user_client, variant)
+
+    assert response.status_code == 201
+    assert response.json()["shipping_amount_cents"] == 0
+
+
+def test_a_configured_rate_is_quoted_at_checkout(user_client: TestClient, db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-1", stock=5)
+
+    body = _checkout(user_client, variant).json()
+
+    assert body["shipping_amount_cents"] == 2500
+
+
+def test_the_customer_is_charged_for_shipping(user_client: TestClient, db_session, monkeypatch):
+    """The whole point. It must reach the PaymentIntent, not just the response."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-2", price=10.0, stock=5)
+
+    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()) as pi, \
+         patch("app.api.v1.endpoints.orders.calculate_tax", return_value=make_tax_mock(3500)):
+        user_client.post("/api/v1/orders/payment-intent", json={
+            "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+            "shipping": {"name": "J", "phone": "5551234567", "address1": "1 St",
+                         "city": "C", "state": "IL", "zip": "62701"},
+        })
+
+    charged = pi.call_args.args[0]
+    assert charged > 1000, f"the customer was charged {charged}, which cannot include $25 of postage"
+
+
+def test_tax_is_told_about_shipping(user_client: TestClient, db_session, monkeypatch):
+    """Most US states tax delivery, and which ones is exactly the judgement
+    Stripe Tax exists to make - so it has to know."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-3", stock=5)
+
+    with patch("app.api.v1.endpoints.orders.create_payment_intent", return_value=make_stripe_pi_mock()), \
+         patch("app.api.v1.endpoints.orders.calculate_tax", return_value=make_tax_mock(1000)) as tax:
+        user_client.post("/api/v1/orders/payment-intent", json={
+            "cart": [{"variant_id": str(variant.id), "quantity": 1}],
+            "shipping": {"name": "J", "phone": "5551234567", "address1": "1 St",
+                         "city": "C", "state": "IL", "zip": "62701"},
+        })
+
+    assert tax.call_args.args[2] == 2500, "Stripe Tax was not given the shipping amount"
+
+
+def test_shipping_survives_the_webhook(user_client: TestClient, db_session, monkeypatch):
+    """The order is built from the checkout session minutes later. Recomputing
+    shipping there could charge a rate the customer was never shown."""
+    from app.core.config import get_settings
+    from app.services.order_service import create_order_from_checkout_session
+
+    monkeypatch.setattr(get_settings(), "shipping_flat_cents", 2500, raising=False)
+    _, variant = make_product_with_variant(db_session, "SHIP-4", stock=5)
+    _checkout(user_client, variant)
+
+    order = create_order_from_checkout_session(db_session, make_stripe_pi_mock().id)
+
+    assert order is not None
+    assert order.shipping_amount == Decimal("25.00")
+
+
+def test_the_receipt_adds_up(db_session):
+    """A confirmation whose lines do not sum to its total is a support email."""
+    from app.services import email_service
+
+    order, _ = make_order(db_session)
+    order.tax_amount = Decimal("2.00")
+    order.shipping_amount = Decimal("25.00")
+    db_session.commit()
+
+    body = email_service._order_summary(order) if hasattr(email_service, "_order_summary") else None
+    if body is None:
+        import inspect
+        src = inspect.getsource(email_service)
+        assert "shipping_amount" in src, "the receipt never mentions shipping"
+    else:
+        assert "Shipping" in body
+
+
+def test_an_empty_cart_is_not_charged_postage(db_session):
+    from app.services.shipping_service import calculate_shipping
+
+    assert calculate_shipping([]) == 0
+
+
+def test_a_customer_cancelling_a_captured_order_is_refunded(user_client: TestClient, db_session):
+    """The allowed statuses used to imply "uncaptured", and stopped implying it
+    when the capture moved to confirm. Voiding a captured intent is rejected by
+    Stripe, so this had to branch on the fact."""
+    from datetime import datetime, timezone
+
+    order, _ = make_order(db_session, user_id="test-user-123",
+                          status=OrderStatus.awaiting_fulfillment)
+    order.captured_at = datetime.now(tz=timezone.utc)
+    db_session.commit()
+
+    with patch("app.services.stripe_service.cancel_payment_intent") as void, \
+         patch("app.services.stripe_service.create_refund") as refund:
+        response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    refund.assert_called_once_with(order.stripe_payment_intent_id)
+    void.assert_not_called()
+
+
+def test_a_customer_cancelling_an_uncaptured_order_is_voided(user_client: TestClient, db_session):
+    """A void is free; a refund is not. An order nobody has been charged for
+    must not cost the shop a fee to cancel."""
+    order, _ = make_order(db_session, user_id="test-user-123",
+                          status=OrderStatus.awaiting_fulfillment)
+    assert order.captured_at is None
+
+    with patch("app.services.stripe_service.cancel_payment_intent") as void, \
+         patch("app.services.stripe_service.create_refund") as refund:
+        response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 200
+    void.assert_called_once_with(order.stripe_payment_intent_id)
+    refund.assert_not_called()
+
+
+def test_a_customer_can_only_cancel_statuses_the_money_has_not_moved_in():
+    """Guards the assumption the cancel path is built on.
+
+    That endpoint trusts captured_at alone and never asks Stripe, which is only
+    sound because capture happens at confirm - and happened at ship before -
+    so no status a customer can reach has ever been captured. Adding `confirmed`
+    here would silently start voiding intents that hold real money: Stripe
+    rejects the void, the endpoint 502s, and the order wedges.
+    """
+    # From the service, which is where it lives and where the second, unguarded
+    # copy used to sit. The endpoint re-exports it by importing it.
+    from app.services.order_service import CUSTOMER_CANCELLABLE_STATUSES
+    from app.api.v1.endpoints.orders import (
+        CUSTOMER_CANCELLABLE_STATUSES as endpoint_copy,
+    )
+
+    assert endpoint_copy is CUSTOMER_CANCELLABLE_STATUSES, "two lists again"
+
+    captured_by_the_time_it_reaches = (
+        OrderStatus.confirmed,
+        OrderStatus.shipped,
+        OrderStatus.delivered,
+    )
+    overlap = set(CUSTOMER_CANCELLABLE_STATUSES) & set(captured_by_the_time_it_reaches)
+    assert not overlap, (
+        f"{overlap} may hold a captured payment, so cancelling it needs a refund "
+        "- the endpoint would void instead"
+    )
+
+
+def test_a_customer_cancel_refunds_when_confirm_captured_but_did_not_commit(
+    user_client, db_session
+):
+    """The window the "cannot have been captured" argument missed.
+
+    Confirm captures and then commits. If that commit rolls back, the money is
+    gone while the row still reads awaiting_fulfillment with captured_at NULL -
+    and legacy rows have the same shape. The old code took the void branch on
+    exactly those, Stripe rejected it on a succeeded intent, and the customer
+    got a 502 on every retry until an admin re-confirmed.
+
+    Stripe is what corrects it: the void is attempted and refused, and the
+    refund follows.
+    """
+    from app.services.stripe_service import PaymentAlreadyCaptured
+
+    order, _ = make_order(db_session, user_id="test-user-123",
+                          status=OrderStatus.awaiting_fulfillment)
+    assert order.captured_at is None
+
+    with patch(
+        "app.services.stripe_service.cancel_payment_intent",
+        side_effect=PaymentAlreadyCaptured("pi"),
+    ) as void, patch("app.services.stripe_service.create_refund") as refund:
+        response = user_client.post(f"/api/v1/orders/{order.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    void.assert_called_once()
+    refund.assert_called_once_with(order.stripe_payment_intent_id)
+

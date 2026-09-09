@@ -317,11 +317,11 @@ def test_webhook_sold_out_voids_the_auth_and_acknowledges(client, db_session):
     pi_id = f"pi_{uuid.uuid4().hex}"
     make_checkout_session(db_session, pi_id, variant.id)
 
-    with patch("app.api.v1.endpoints.stripe_webhook.cancel_payment_intent") as void:
+    with patch("app.api.v1.endpoints.stripe_webhook.release_funds") as void:
         response = post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
 
     assert response.status_code == 200, "a 500 here buys days of pointless Stripe retries"
-    void.assert_called_once_with(pi_id)
+    void.assert_called_once_with(pi_id, known_captured=False)
 
     # No order, and the session is gone so a retry does not re-attempt it.
     assert db_session.scalar(
@@ -345,7 +345,7 @@ def test_webhook_keeps_the_session_when_the_void_fails(client, db_session):
     pi_id = f"pi_{uuid.uuid4().hex}"
     make_checkout_session(db_session, pi_id, variant.id)
 
-    with patch("app.api.v1.endpoints.stripe_webhook.cancel_payment_intent",
+    with patch("app.api.v1.endpoints.stripe_webhook.release_funds",
                side_effect=RuntimeError("stripe is down")):
         try:
             post_webhook(client, pi_id, "payment_intent.amount_capturable_updated")
@@ -374,3 +374,33 @@ def test_webhook_still_creates_the_order_when_stock_is_there(client, db_session)
     assert db_session.get(ProductVariant, variant.id).stock == 4, (
         "creating the order did not take the stock"
     )
+
+
+def test_a_sold_out_intent_that_is_already_captured_is_refunded(client, db_session):
+    """Sold out is reached from payment_intent.succeeded too, so the money may
+    already be taken.
+
+    This path called the void directly until it did not: a bare cancel is
+    rejected on a captured intent, the webhook 500s, Stripe retries for days,
+    and a charged customer with no order is never refunded. release_funds is
+    what makes the void-or-refund choice everywhere else, and now here.
+    """
+    from app.services.stripe_service import PaymentAlreadyCaptured
+
+    variant = make_product_and_variant(db_session)
+    variant.stock = 0
+    db_session.commit()
+
+    pi_id = f"pi_{uuid.uuid4().hex}"
+    make_checkout_session(db_session, pi_id, variant.id)
+
+    with patch(
+        "app.services.stripe_service.cancel_payment_intent",
+        side_effect=PaymentAlreadyCaptured(pi_id),
+    ) as void, patch("app.services.stripe_service.create_refund") as refund:
+        response = post_webhook(client, pi_id, "payment_intent.succeeded")
+
+    assert response.status_code == 200, "a 500 here buys days of pointless Stripe retries"
+    void.assert_called_once()
+    refund.assert_called_once_with(pi_id)
+
