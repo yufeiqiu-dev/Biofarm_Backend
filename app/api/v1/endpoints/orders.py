@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import uuid
 from decimal import Decimal
 
@@ -23,12 +24,15 @@ from app.services.order_service import (
     get_orders_for_user,
     save_checkout_session,
 )
+from app.services.cart_service import CartOwner, clear_bought_lines
 from app.services.shipping_service import calculate_shipping
 from app.services.stripe_service import (
     release_funds,
     calculate_tax,
     create_payment_intent,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -183,6 +187,30 @@ def initiate_checkout(
             )
             order.status = OrderStatus.awaiting_fulfillment
             db.commit()
+
+            # The basket has been bought. Bypass creates the order inline, so
+            # there is no webhook to do this - and without it a local checkout
+            # leaves the customer holding a basket of what they just paid for.
+            #
+            # Only the lines bought: anything added from another device in the
+            # meantime was not paid for and stays.
+            #
+            # Best effort, and it must stay that way. The order is already
+            # committed by this point, so letting a failure here escape would
+            # return a 500 from checkout for an order that exists - the customer
+            # sees a failed payment and checks out again. A basket that did not
+            # empty is a far smaller problem, and the customer can clear it.
+            try:
+                clear_bought_lines(
+                    db,
+                    CartOwner.user(current_user["sub"]),
+                    [(i.variant_id, i.quantity) for i in payload.cart],
+                )
+                db.commit()
+            except Exception:  # noqa: BLE001 - the order matters, the basket does not
+                db.rollback()
+                logger.exception("could not empty the basket for order %s", order.id)
+
             return PaymentIntentResponse(
                 client_secret=pi.client_secret,
                 order_id=order.id,
