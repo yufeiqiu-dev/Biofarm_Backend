@@ -20,6 +20,8 @@ worth an order for.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import logging
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -99,12 +101,22 @@ def _send(order: Order, subject: str, body: str) -> None:
 
 def send_order_confirmation(order: Order) -> None:
     """Sent when the webhook turns a paid checkout into an order."""
-    total = order.total_amount + order.tax_amount
+    # Shipping is part of what was charged, so it is part of what the receipt
+    # has to show. A confirmation whose lines do not add up to its total is a
+    # support email.
+    #
+    # `or 0` rather than trusting nullable=False: the column's defaults apply at
+    # INSERT, so an Order that has not been flushed reads None here. This module
+    # runs on the webhook path and must not raise - a TypeError would escape as
+    # a 500 to Stripe and have a paid order retried.
+    shipping = order.shipping_amount or Decimal("0")
+    total = order.total_amount + shipping + order.tax_amount
     body = (
         f"Thanks for your order.\n\n"
         f"Order number: {order.order_number}\n\n"
         f"{_order_lines(order)}\n\n"
         f"Subtotal: {_money(order.total_amount)}\n"
+        f"Shipping: {_money(shipping)}\n"
         f"Tax:      {_money(order.tax_amount)}\n"
         f"Total:    {_money(total)}\n\n"
         f"Shipping to:\n"
@@ -141,8 +153,14 @@ def send_order_cancelled(order: Order) -> None:
     """Sent on cancellation, by either the customer or an admin.
 
     Says what happened to the money, because that is the only question a
-    cancellation email needs to answer: before shipping the authorization is
-    voided and nothing was ever taken; afterwards it is refunded.
+    cancellation email needs to answer.
+
+    The body hedges rather than naming a boundary, and that is deliberate. The
+    boundary used to be shipping; it is confirm now, since that is where capture
+    moved - and a legacy row or a confirm whose commit rolled back can be
+    captured while its status says otherwise, so the status does not settle it
+    either. release_funds attempts the void and refunds if Stripe says the money
+    already moved, which means only Stripe knows at the time this is written.
     """
     body = (
         f"Your order has been cancelled.\n\n"

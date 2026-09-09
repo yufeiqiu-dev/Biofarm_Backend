@@ -146,3 +146,37 @@ def user_client(db_session):
         yield c
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_stripe(monkeypatch):
+    """Make an unstubbed Stripe call fail loudly instead of reaching the network.
+
+    The suite pins STRIPE_BYPASS=false so the real code paths are exercised, and
+    every test patches the Stripe functions it expects to be called. A test that
+    forgets one does not fail cleanly - it makes a live HTTPS request with a
+    dummy key, waits for it, and reports a 502 from somewhere unrelated. That
+    has now happened twice while adding a single new Stripe call, each time
+    costing a diagnosis.
+
+    Patching the client factory means anything not stubbed at the call site
+    raises here, naming itself.
+    """
+
+    def refuse():
+        # pytest.fail, not AssertionError. Both money branches wrap their Stripe
+        # calls in `except Exception -> HTTPException(502)`, so an AssertionError
+        # raised here came back as a 502 - indistinguishable from a genuine
+        # Stripe failure. A test asserting 502 would then pass green while never
+        # exercising the branch it names, which is the failure this guard exists
+        # to prevent, reintroduced by the guard itself.
+        #
+        # pytest.fail raises Failed, which derives from BaseException and so
+        # passes straight through `except Exception`.
+        pytest.fail(
+            "a test reached the real Stripe API - patch the function it calls, "
+            "e.g. patch('app.services.stripe_service.create_refund')",
+            pytrace=False,
+        )
+
+    monkeypatch.setattr("app.services.stripe_service._get_stripe", refuse)

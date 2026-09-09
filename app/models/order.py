@@ -34,6 +34,7 @@ class Order(Base):
         # negative order.
         CheckConstraint("total_amount >= 0", name="ck_orders_total_not_negative"),
         CheckConstraint("tax_amount >= 0", name="ck_orders_tax_not_negative"),
+        CheckConstraint("shipping_amount >= 0", name="ck_orders_shipping_not_negative"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -62,8 +63,35 @@ class Order(Base):
     card_last4: Mapped[str] = mapped_column(String(4), nullable=False, server_default="")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     tracking_number: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When the money was actually taken, or NULL if it has not been.
+    #
+    # A fact, not an inference. Capture used to be deduced from status - before
+    # the capture moved to confirm, `confirmed` meant "not captured"; after, it
+    # meant "captured" - so the same status meant opposite things either side of
+    # a deploy. Orders in flight would have shipped unpaid, and cancelling one
+    # would have attempted a refund on an uncaptured intent, which Stripe
+    # rejects: an order that could not be cancelled at all.
+    #
+    # Recording it also makes the capture idempotent. A retry after a failed
+    # commit would otherwise capture a second time, which Stripe also rejects.
+    captured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default="0.00")
+    # What the customer paid to have it sent. Stored rather than recomputed: the
+    # rate can change, and an old order must still add up to what was charged.
+    shipping_amount: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2),
+        nullable=False,
+        # server_default fills existing rows and any INSERT that omits the
+        # column; `default` supplies the value at flush time. Neither populates
+        # the *attribute* of an Order that has not been flushed - it reads None
+        # until then, which is why email_service treats a missing amount as
+        # zero rather than trusting nullable=False.
+        default=Decimal("0.00"),
+        server_default="0.00",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
