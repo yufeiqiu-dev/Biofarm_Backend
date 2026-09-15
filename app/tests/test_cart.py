@@ -391,7 +391,7 @@ def test_a_basket_that_will_not_empty_does_not_fail_the_order(client: TestClient
     order for one payment.
     """
     from app.models.order import Order
-    from app.services import order_service
+    from app.services import cart_service
     from app.tests.test_stripe_webhook import make_checkout_session, post_webhook
 
     variant = make_variant(db_session, "AB-123", stock=5)
@@ -400,7 +400,9 @@ def test_a_basket_that_will_not_empty_does_not_fail_the_order(client: TestClient
     def explode(*args, **kwargs):
         raise RuntimeError("cart row locked")
 
-    monkeypatch.setattr(order_service, "clear_bought_lines", explode)
+    # The inner call, so the best-effort wrapper's own try/except is what is
+    # under test.
+    monkeypatch.setattr(cart_service, "clear_bought_lines", explode)
 
     response = post_webhook(client, "pi_cart_boom", "payment_intent.amount_capturable_updated")
 

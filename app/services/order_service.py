@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.checkout_session import CheckoutSession
-from app.services.cart_service import CartOwner, clear_bought_lines
+from app.services.cart_service import CartOwner, clear_bought_lines_best_effort
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product_variant import ProductVariant
 from app.schemas.order import CartItemIn, ShippingIn
@@ -467,20 +467,19 @@ def create_order_from_checkout_session(
     db.delete(session)
     db.commit()
 
-    # After the commit, and unable to fail it.
-    #
-    # The order is what matters and it is now durable. Sharing the commit meant
-    # a lock timeout on a cart row - the customer's other device editing the
-    # basket at that moment - failed the whole webhook, and Stripe retries a
-    # webhook whose CheckoutSession is still there: a second order for one
-    # payment. A basket that did not empty is a far smaller problem, and the
-    # customer can empty it. Same reasoning as the confirmation email below.
-    try:
-        clear_bought_lines(db, buyer, [(item.variant_id, item.quantity) for item in cart])
-        db.commit()
-    except Exception:  # noqa: BLE001 - the order matters, the basket does not
-        db.rollback()
-        logger.exception("could not empty the basket after order %s", order.order_number)
+    # After the commit, and unable to fail it - a lock timeout on a cart row the
+    # customer's other device is editing must not fail the webhook and have
+    # Stripe retry it into a second order. order_ref is a callable rather than
+    # `order.order_number` read here: `order` is expired by the commit above,
+    # so reading it eagerly would cost a SELECT on every webhook, including the
+    # near-universal happy path where nothing ever logs it. Same reasoning as
+    # the confirmation email below.
+    clear_bought_lines_best_effort(
+        db,
+        buyer,
+        [(item.variant_id, item.quantity) for item in cart],
+        order_ref=lambda: order.order_number,
+    )
 
     db.refresh(order)
 

@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import (
     CheckConstraint,
@@ -13,6 +14,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.models.product_variant import ProductVariant
+
+# The ceiling on one line's quantity. Enforced in app code, not the DB (the
+# table's own CHECK is only quantity > 0) - but it belongs with the data
+# constraint rather than in a service, so cart_service's clamp and the request
+# schemas' bounds read from one place. An unbounded quantity makes the tax call
+# and the card authorisation absurd; nothing sensible orders more than this.
+MAX_LINE_QUANTITY = 999
 
 
 class CartItem(Base):
@@ -65,6 +73,39 @@ class CartItem(Base):
     )
     quantity: Mapped[int] = mapped_column(nullable=False)
 
+    """
+    Two clocks, for two different jobs. See
+    Biofarm_KnowledgeBase/documentation/designs/2026-09-08-local-first-cart-sync.md
+    for the full reasoning.
+
+    `client_updated_at` is when the customer actually made the change, as their
+    own device's clock reports it - not when the row reached this database. That
+    distinction is the whole point: the cart is edited offline (local-first,
+    synced later), so a device reconnecting after an hour offline must not win a
+    conflict just because its write happened to land last. Ordering by
+    `updated_at` would do exactly that.
+
+    `updated_at` stays a plain server timestamp, for sweeping and debugging -
+    nothing about conflict resolution reads it.
+    """
+    client_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    """
+    A tombstone, not a deleted row.
+
+    A removed line has to be remembered as removed, or a merge cannot tell "this
+    was deleted at 10pm" from "this device has never heard of this line" - and
+    treats the second as license to resurrect the first. `quantity` is left
+    alone rather than zeroed: the table's own CHECK (quantity > 0) forbids it,
+    and there is no reason to throw the last known quantity away.
+
+    Swept by app.jobs.cleanup after they are old enough that no plausible
+    offline device could still be carrying a pre-deletion copy.
+    """
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Named variant_ref rather than variant, so it cannot be mistaken for the
     # variant_id column when reading a query.
     variant_ref: Mapped["ProductVariant"] = relationship(lazy="raise")
@@ -77,7 +118,10 @@ class CartItem(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
-        # A guest-basket sweep will filter on this, and an unindexed sweep scans
-        # the table - the same reason checkout_sessions indexes created_at.
+        # Indexed for ad-hoc "what changed recently" ops queries. The tombstone
+        # sweep filters on deleted_at, not this - that predicate is unindexed
+        # and the daily sweep scans the table, which is deferred the same way
+        # list-endpoint pagination is (see CLAUDE.md): cart_items is tiny, and a
+        # partial index on deleted_at is speculative until it is not.
         index=True,
     )
