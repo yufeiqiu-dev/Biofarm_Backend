@@ -101,10 +101,18 @@ class Settings(BaseSettings):
     """
 
     email_from: str = ""
-    """The SES-verified From address. Required unless email_bypass is on.
+    """The SES-verified From address.
 
-    SES will not send from an identity it has not verified, so this is the one
-    piece of email configuration that cannot have a sensible default.
+    Not required, even under APP_ENV=prod - deliberately, unlike the other
+    fields _refuse_unsafe_production_config checks. Leaving it blank does not
+    lie the way email_bypass does: _send() already sends nothing and logs
+    when this is empty (an empty Source raises botocore's own
+    ParamValidationError, which the module's blanket except already catches),
+    so a deployment can come up healthy and take real orders before SES is
+    configured - order-confirmation mail just does not go out yet. That gap
+    is meant to be closed promptly, not lived in; app_stack.py's tests are
+    where "production must have a real one" is actually enforced, since
+    that decision belongs with the rest of what differs between environments.
     """
 
     email_reply_to: str = ""
@@ -236,8 +244,10 @@ class Settings(BaseSettings):
                 "EMAIL_BYPASS must be false "
                 "(customers would be charged and never told their order exists)"
             )
-        if not self.email_from:
-            problems.append("EMAIL_FROM is required (SES will not send from an unverified identity)")
+        # EMAIL_FROM is deliberately not checked here - see its docstring. It is
+        # the one piece of "unsafe production config" this validator does not
+        # treat as unsafe, because leaving it blank degrades (no confirmation
+        # mail) rather than lies (a charge with no record of having said so).
         if not self.stripe_secret_key.get_secret_value():
             problems.append("STRIPE_SECRET_KEY is required")
         if not self.stripe_webhook_secret.get_secret_value():

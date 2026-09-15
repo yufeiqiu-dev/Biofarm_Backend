@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,6 +9,8 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 
 import app.models  # noqa: F401 - registers ORM models on Base.metadata
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -30,6 +33,15 @@ settings = get_settings()
 # root alone, so without this every logger.info in the application is discarded
 # and the failures email_service deliberately swallows leave no trace at all.
 configure_logging(settings.log_level)
+
+# Not fatal (see Settings.email_from) but worth saying loudly once, at the one
+# moment this is guaranteed to be seen: every later symptom is silence, on
+# whichever order happens to trigger the first send attempt.
+if not settings.email_from and not settings.email_bypass:
+    logger.warning(
+        "EMAIL_FROM is not set - order confirmation, shipped, and cancellation "
+        "emails will fail to send (and be logged, not raised) until it is."
+    )
 
 app = FastAPI(
     title=settings.app_name,

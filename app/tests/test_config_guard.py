@@ -66,13 +66,15 @@ def test_production_refuses_email_bypass():
         Settings(**{**SAFE_PROD, "email_bypass": True})
 
 
-def test_production_requires_a_verified_sender():
-    """Without EMAIL_FROM, SES rejects every message and email_service swallows
-    the failure by design - so the symptom is no mail at all and nothing in the
-    interface to suggest it. Refusing to boot is the only visible failure
-    available."""
-    with pytest.raises(ValidationError, match="EMAIL_FROM"):
-        Settings(**{**SAFE_PROD, "email_from": ""})
+def test_production_boots_without_a_configured_sender():
+    """Unlike every other field this guard checks, a blank EMAIL_FROM degrades
+    rather than lies: email_service already sends nothing and logs when it is
+    empty. A deployment can go live and take real orders before SES is set up -
+    see Settings.email_from - order confirmation mail is just what is missing
+    until then. Production requiring a real one is enforced in Biofarm_Infra's
+    tests instead, alongside the rest of what differs between environments."""
+    settings = Settings(**{**SAFE_PROD, "email_from": ""})
+    assert settings.email_from == ""
 
 
 def test_production_requires_stripe_keys():
